@@ -7,10 +7,10 @@ from delta_k_pipeline import generate_image_with_schedule
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="/root/autodl-tmp/SDXL1.0")
+    parser.add_argument("--model", type=str, default="model")
     parser.add_argument("--prompt", type=str, default=None)
     parser.add_argument("--from_file", type=str, default=None)
-    parser.add_argument("--outdir", type=str, default="/root/autodl-tmp/DeltaK_LoRA")
+    parser.add_argument("--outdir", type=str, default="output")
     parser.add_argument("--schedule", type=str, default="mean_of_concept")
     parser.add_argument("--steps", type=int, default=40)
     parser.add_argument("--seed", type=int, default=42)
@@ -24,11 +24,11 @@ def _load_prompts(prompt: Optional[str], prompt_file: Optional[str], batch_size:
     if prompt_file:
         file_path = Path(prompt_file)
         if not file_path.exists():
-            raise FileNotFoundError(f"找不到 prompt 文件: {file_path}")
+            raise FileNotFoundError(f" {file_path}")
         lines = file_path.read_text(encoding="utf-8").splitlines()
         return [[line.strip().split("\t")[0]] * batch_size for line in lines]
     if not prompt:
-        raise ValueError("必须提供 prompt 或 prompt 文件")
+        raise ValueError("prompt is required")
     return [[prompt] * batch_size]
 
 
@@ -57,8 +57,7 @@ def main():
                 counter += 1
             except Exception as exc:
                 errors += 1
-                print(f"[WARN] 生成失败：{exc}")
-    print(f"生成完成，失败次数：{errors}")
+                print(f"[WARN] generation failed: {exc}")
 
 
 if __name__ == "__main__":

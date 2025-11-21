@@ -39,25 +39,25 @@ DEFAULT_CONFIG = {
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Delta-K test-time scaling 推理脚本")
-    parser.add_argument("--config_py", type=str, default=None, help="可选：包含 CONFIG/DEFAULT_CONFIG 的 Python 文件")
-    parser.add_argument("--schedule", type=str, default=None, help="要使用的调度策略")
-    parser.add_argument("--from_file", type=str, default=None, help="包含 prompts 的 txt 文件")
-    parser.add_argument("--prompt", type=str, default=None, help="单个 prompt 文本")
-    parser.add_argument("--outdir", type=str, default=None, help="输出目录")
-    parser.add_argument("--steps", type=int, default=None, help="扩散步数")
-    parser.add_argument("--n_iter", type=int, default=None, help="每个 prompt 采样次数")
-    parser.add_argument("--batch_size", type=int, default=None, help="每个 prompt 的 batch 大小")
-    parser.add_argument("--seed", type=int, default=None, help="随机种子")
-    parser.add_argument("--ckpt", type=str, default=None, help="模型路径")
-    parser.add_argument("--qwen_api_key", type=str, default=None, help="用于 present/missing 的 API key")
+    parser = argparse.ArgumentParser(description="Delta-K test-time scaling CLI")
+    parser.add_argument("--config_py", type=str, default=None, help="Optional Python config exposing CONFIG/DEFAULT_CONFIG")
+    parser.add_argument("--schedule", type=str, default=None, help="Sampling schedule name")
+    parser.add_argument("--from_file", type=str, default=None, help="Prompt list txt file")
+    parser.add_argument("--prompt", type=str, default=None, help="Single prompt string")
+    parser.add_argument("--outdir", type=str, default=None, help="Directory to store outputs")
+    parser.add_argument("--steps", type=int, default=None, help="Diffusion steps")
+    parser.add_argument("--n_iter", type=int, default=None, help="Sampling iterations per prompt")
+    parser.add_argument("--batch_size", type=int, default=None, help="Batch size per prompt")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--ckpt", type=str, default=None, help="Model checkpoint path")
+    parser.add_argument("--qwen_api_key", type=str, default=None, help="API key for present/missing analysis")
     return parser.parse_args()
 
 
 def load_prompts_from_file(path: str, batch_size: int = 1) -> List[List[str]]:
     file_path = Path(path)
     if not file_path.exists():
-        raise FileNotFoundError(f"找不到 prompt 文件: {file_path}")
+        raise FileNotFoundError(f" {file_path}")
     prompts = []
     for line in file_path.read_text(encoding="utf-8").splitlines():
         prompt = line.strip().split("\t")[0]
@@ -69,7 +69,7 @@ def load_prompts(prompt: Optional[str], prompt_file: Optional[str], batch_size: 
     if prompt_file:
         return load_prompts_from_file(prompt_file, batch_size=batch_size)
     if not prompt:
-        raise ValueError("未指定 prompt 或 prompt 文件")
+        raise ValueError("prompt")
     return [[prompt] * batch_size]
 
 
@@ -78,12 +78,12 @@ def load_config(path: Optional[str]):
         return DEFAULT_CONFIG
     cfg_path = Path(path)
     if not cfg_path.exists():
-        raise FileNotFoundError(f"找不到配置文件：{cfg_path}")
+        raise FileNotFoundError(f"{cfg_path}")
     data = runpy.run_path(str(cfg_path))
     for key in ("CONFIG", "DEFAULT_CONFIG"):
         if key in data:
             return data[key]
-    raise ValueError(f"{cfg_path} 中没有 CONFIG/DEFAULT_CONFIG 变量")
+    raise ValueError(f"{cfg_path} ")
 
 
 def main():
@@ -124,8 +124,8 @@ def main():
                 counter += 1
             except Exception as exc:
                 errors += 1
-                print(f"[WARN] 采样失败：{exc}")
-    print(f"完成推理，失败次数：{errors}")
+                print(f"[WARN] {exc}")
+
 
 
 if __name__ == "__main__":
