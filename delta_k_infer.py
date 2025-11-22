@@ -6,9 +6,9 @@ from typing import List, Optional
 from delta_k_pipeline import generate_image_with_schedule
 
 DEFAULT_CONFIG = {
-    "model": {"base_path": "/root/autodl-tmp/SDXL1.0"},
+    "model": {"base_path": "path/to/your/model"},
     "data": {
-        "prompt_file": "/root/autodl-tmp/T2I-CompBench/examples/dataset/color_val.txt",
+        "prompt_file": "path/to/your/prompts.txt",
         "single_prompt": None,
     },
     "inference": {
@@ -18,7 +18,7 @@ DEFAULT_CONFIG = {
         "batch_size": 1,
         "n_iter": 1,
     },
-    "output": {"dir": "/root/autodl-tmp/T2I-CompBench/examples"},
+    "output": {"dir": "output"},
     "schedulers": {
         "linear_smax": 0.004,
         "linear_T_lin": 12,

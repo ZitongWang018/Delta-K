@@ -5,9 +5,9 @@ We propose Delta-K, a training-free, plug-and-play framework that enhances compo
 ### Quick Start
 
 ```bash
-python /root/Delta-K/delta_k_infer.py \
-  --config_py /root/Delta-K/my_config.py \  
+python delta_k_infer.py \
+  --config_py my_config.py \
   --schedule mean_of_concept \
-  --qwen_api_key sk-xxx \
+  --qwen_api_key YOUR_API_KEY \
   --prompt "a cozy living room with warm lights"
 ```

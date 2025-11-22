@@ -274,7 +274,10 @@ def analyze_present_missing(image: Image.Image, prompt: str, top_k: int = 8) -> 
     api_key = os.getenv("DASHSCOPE_API_KEY")
     if not api_key or OpenAI is None:
         return [], []
-    client = OpenAI(api_key=api_key, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+    api_base_url = os.getenv("VLM_API_BASE_URL")
+    if not api_base_url:
+        return [], []
+    client = OpenAI(api_key=api_key, base_url=api_base_url)
     data_url = pil_to_data_url(image)
     instruction = f"""
 You are a vision QA tool. Compare the image with this text prompt:
