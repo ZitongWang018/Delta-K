@@ -95,7 +95,8 @@ def main():
     schedule = args.schedule or cfg["inference"]["schedule"]
     n_iter = args.n_iter or cfg["inference"]["n_iter"]
     batch_size = args.batch_size or cfg["inference"]["batch_size"]
-    prompt_file = args.from_file or cfg["data"]["prompt_file"]
+    # 当传入 --prompt 时优先使用命令行 prompt，不从文件读
+    prompt_file = args.from_file if args.from_file else (None if args.prompt else cfg["data"]["prompt_file"])
     prompt_text = args.prompt or cfg["data"]["single_prompt"]
     outdir = args.outdir or cfg["output"]["dir"]
     sched_config = cfg.get("schedulers", {})
