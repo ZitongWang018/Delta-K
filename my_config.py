@@ -6,7 +6,7 @@ import os
 
 CONFIG = {
     "model": {
-        "base_path": os.environ.get("DELTA_K_MODEL_PATH", "/root/autodl-tmp/model"),
+        "base_path": os.environ.get("DELTA_K_MODEL_PATH", "/data/yulin/hf_cache/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b/"),
     },
     "data": {
         "prompt_file": None,

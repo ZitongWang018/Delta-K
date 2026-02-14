@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from delta_k_pipeline import generate_image_with_schedule
-
+from delta_k_utils import *
 DEFAULT_CONFIG = {
     "model": {"base_path": "path/to/your/model"},
     "data": {
@@ -108,24 +108,26 @@ def main():
 
     counter = len(list(sample_dir.glob("*.png")))
     errors = 0
+    attn_cap = BaseCrossAttentionCapture(model_type='sdxl')
     for batch_prompts in prompts:
         for iteration in range(n_iter):
-            try:
-                image = generate_image_with_schedule(
-                    model_path=model_path,
-                    prompt=batch_prompts[0],
-                    schedule=schedule,
-                    steps=steps,
-                    seed=seed + iteration,
-                    qwen_api_key=args.qwen_api_key,
-                    schedule_config=sched_config,
-                )
-                filename = f"{batch_prompts[0]}_{counter:06d}.png"
-                image.save(sample_dir / filename)
-                counter += 1
-            except Exception as exc:
-                errors += 1
-                print(f"[WARN] {exc}")
+            # try:
+            image = generate_image_with_schedule(
+                model_path=model_path,
+                prompt=batch_prompts[0],
+                schedule=schedule,
+                steps=steps,
+                seed=seed + iteration,
+                qwen_api_key=args.qwen_api_key,
+                schedule_config=sched_config,
+                attn_cap=attn_cap
+            )
+            filename = f"{batch_prompts[0]}_{counter:06d}.png"
+            image.save(sample_dir / filename)
+            counter += 1
+            # except Exception as exc:
+            #     errors += 1
+            #     print(f"[WARN] {exc}")
 
 
 

@@ -4,8 +4,6 @@ import numpy as np
 import torch
 from torch.optim import Adam
 
-from delta_k_utils import attention_qk
-
 
 def get_schedule(
     name: str,
@@ -19,6 +17,7 @@ def get_schedule(
     attn_neg: List[Dict],
     indices: List[int],
     config: Dict,
+    attn_cap=None,  # [新增参数] 传入 BaseCrossAttentionCapture 的实例
 ):
     if name == "baseline":
         return []
@@ -58,11 +57,12 @@ def get_schedule(
         )
     if name == "mean_of_concept":
         return build_mean_of_concept_schedule(
-            mean_targets,
-            attn_pos,
-            attn_neg,
-            indices,
+            target_stats=mean_targets,
+            attn_pos=attn_pos,
+            attn_neg=attn_neg,
+            indices=indices,
             max_steps=config.get("mean_steps", 10),
+            attn_cap=attn_cap, # [新增传递] 
             strength_limit=config.get("mean_strength", 0.03),
         )
     raise ValueError(f"未知调度：{name}")
@@ -146,21 +146,31 @@ def build_vlm_gap_burst(
     burst = np.exp(-time / max(1e-6, tau))
     alpha = _compute_alpha(k_present, k_missing, alpha_floor)
     return (smax * alpha * burst * window).tolist()
+
 def build_mean_of_concept_schedule(
     target_stats: List[Dict],
     attn_pos: List[Dict],
     attn_neg: List[Dict],
     indices: List[int],
     max_steps: int,
+    attn_cap,  # [新增参数] 接收捕获实例以获取动态的方法和模型属性
     strength_limit: float = 0.03,
 ) -> List[float]:
     schedule = []
+    
+    # [核心修改 1] 动态匹配层名前缀
+    # SDXL 通常通过干预 down_blocks.1 来控制早期概念布局
+    # FLUX 则干预早中期的 transformer_blocks
+    layer_filter = "transformer_blocks" if attn_cap.model_type == "flux" else "down_blocks.1"
+
     for step in range(min(len(attn_pos), max_steps)):
         if step >= len(attn_neg) or step >= len(target_stats):
             break
+            
         layer_names = [
-            name for name in attn_pos[step]["attention_weights"].keys() if "down_blocks.1" in name
+            name for name in attn_pos[step]["attention_weights"].keys() if layer_filter in name
         ]
+        
         if not layer_names:
             schedule.append(0.0)
             continue
@@ -169,10 +179,13 @@ def build_mean_of_concept_schedule(
             total = 0.0
             for name in layer_names:
                 a_mean = target_stats[step][name]
-                attn = attention_qk(
+                
+                # [核心修改 2] 调用实例的多态 attention_qk 方法
+                attn = attn_cap.attention_qk(
                     attn_pos[step]["q_record"][name],
                     alpha * (attn_pos[step]["k_record"][name] - attn_neg[step]["k_record"][name]),
                 )
+                
                 attn = attn[0, :, indices]
                 expanded = torch.broadcast_to(a_mean.unsqueeze(1), attn.shape)
                 total = total + ((expanded - attn) ** 2).sum()
@@ -186,8 +199,9 @@ def build_mean_of_concept_schedule(
             grad = torch.autograd.grad(loss_val, alpha, create_graph=True)[0]
             (grad ** 2).backward()
             optimizer.step()
+            
         value = float(alpha.item())
         value = max(-strength_limit, min(strength_limit, value))
         schedule.append(value)
+        
     return schedule
-
