@@ -27,9 +27,8 @@ def generate_image_with_schedule(
         raise ValueError("必须传入 attn_cap 实例以感知当前模型架构")
 
     # [架构路由 1]：动态层前缀
-    is_flux = attn_cap.model_type == "flux"
-    target_layer_prefix = "transformer_blocks" if is_flux else "down_blocks.1"
-    general_layer_prefix = "transformer_blocks" if is_flux else "down_blocks"
+    target_layer_prefix = attn_cap.target_layer_prefix
+    general_layer_prefix = attn_cap.general_layer_prefix
 
     # 注意：这里的 run_diffusion_once 需要确保能够接收并使用我们传入的 attn_cap
     img_baseline, _, steps_record = run_diffusion_once(
@@ -64,7 +63,7 @@ def generate_image_with_schedule(
         return img_baseline
 
     # [架构路由 3]：动态遮罩占位符 (SDXL 用 <|endoftext|>, FLUX 的 T5 用 <pad>)
-    mask_placeholder = "<pad>" if is_flux else "<|endoftext|>"
+    mask_placeholder = attn_cap.mask_placeholder
     prompt_masked = mask_prompt_with_missing(prompt, missing, placeholder=mask_placeholder)
     
     # 将 attn_cap 传给特征提取函数

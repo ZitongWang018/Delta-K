@@ -100,6 +100,7 @@ def main():
     prompt_text = args.prompt or cfg["data"]["single_prompt"]
     outdir = args.outdir or cfg["output"]["dir"]
     sched_config = cfg.get("schedulers", {})
+    model_type=cfg["model"]["model_type"]
 
     prompts = load_prompts(prompt_text, prompt_file, batch_size=batch_size)
     outdir = Path(outdir)
@@ -108,7 +109,7 @@ def main():
 
     counter = len(list(sample_dir.glob("*.png")))
     errors = 0
-    attn_cap = BaseCrossAttentionCapture(model_type='sdxl')
+    attn_cap = BaseCrossAttentionCapture(model_type=model_type)
     for batch_prompts in prompts:
         for iteration in range(n_iter):
             # try:

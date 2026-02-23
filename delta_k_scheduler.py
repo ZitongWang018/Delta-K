@@ -17,7 +17,7 @@ def get_schedule(
     attn_neg: List[Dict],
     indices: List[int],
     config: Dict,
-    attn_cap=None,  # [新增参数] 传入 BaseCrossAttentionCapture 的实例
+    attn_cap=None,
 ):
     if name == "baseline":
         return []
@@ -161,7 +161,7 @@ def build_mean_of_concept_schedule(
     # [核心修改 1] 动态匹配层名前缀
     # SDXL 通常通过干预 down_blocks.1 来控制早期概念布局
     # FLUX 则干预早中期的 transformer_blocks
-    layer_filter = "transformer_blocks" if attn_cap.model_type == "flux" else "down_blocks.1"
+    layer_filter = attn_cap.target_layer_prefix
 
     for step in range(min(len(attn_pos), max_steps)):
         if step >= len(attn_neg) or step >= len(target_stats):

@@ -4,75 +4,98 @@ import json
 import math
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import torch
 from PIL import Image
 
 try:
-    from transformers import CLIPTokenizer
+    from transformers import CLIPTokenizer, T5TokenizerFast
 except Exception:
     CLIPTokenizer = None
+    T5TokenizerFast = None
 
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
+# ==========================================
+# 1. 核心架构：面向对象的 Attention Capture
+# ==========================================
 
-def attention_qk(query: torch.Tensor, key: torch.Tensor, head_dim: int = 64) -> torch.Tensor:
-        """
-        改进版：严格对齐 SDXL 的多头注意力计算逻辑
-        SDXL Diffusers UNet 默认的 attention_head_dim 通常为 64
-        """
-        q = query.to(torch.float32)
-        k = key.to(torch.float32)
-        
-        b, sq, d = q.shape
-        _, sk, _ = k.shape
-        
-        # 动态计算当前层的 Head 数量 (例如 d=2048, head_dim=64 -> heads=32)
-        heads = d // head_dim
-        
-        # 重塑并转置为多头格式: [batch, heads, seq, head_dim]
-        q = q.view(b, sq, heads, head_dim).transpose(1, 2)
-        k = k.view(b, sk, heads, head_dim).transpose(1, 2)
-        
-        # 严格使用 head_dim 的平方根进行缩放
-        scale = math.sqrt(head_dim)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / scale
-        
-        # 减去最大值以保证 Softmax 的数值稳定性 (防止溢出)
-        scores = scores - scores.max(dim=-1, keepdim=True).values
-        probs = torch.softmax(scores, dim=-1)
-        
-        # 对所有 Head 的注意力权重取平均，降维回 2D 关系图: [batch, seq_img, seq_txt]
-        probs = probs.mean(dim=1)
-        
-        return torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
+class BaseCrossAttentionCapture:
+    """
+    [架构无关] 注意力捕获基础父类。
+    处理数据存储、Hook 管理、特征注入等通用逻辑。
+    """
+    def __new__(cls, model_type: str, *args, **kwargs):
+        if cls is BaseCrossAttentionCapture:
+            if model_type not in MODEL_TO_CLASS:
+                raise ValueError(f"不支持的模型类型: '{model_type}'。支持的类型有: {list(MODEL_TO_CLASS.keys())}")
+            
+            target_class = MODEL_TO_CLASS[model_type]
+            instance = super().__new__(target_class)
+            return instance
+            
+        return super().__new__(cls)
 
-
-class CrossAttentionCapture:
-    def __init__(self) -> None:
+    def __init__(self, model_type: str) -> None:
+        if getattr(self, "_initialized", False):
+            return
+            
         self.q: Dict[str, Dict[str, torch.Tensor]] = {}
         self.k: Dict[str, Dict[str, torch.Tensor]] = {}
         self.v: Dict[str, Dict[str, torch.Tensor]] = {}
         self.hooks: List[torch.utils.hooks.RemovableHandle] = []
         self.step = 0
+        self.model_type = model_type
+        self.target_layer_prefix = self._get_target_layer_prefix(model_type)
+        self.general_layer_prefix = self._get_general_layer_prefix(model_type)
+        self.mask_placeholder = self._get_mask_placeholder(model_type)
+        self.net = self._get_net(model_type)
+        self.tensor_inputs = self._get_tensor_inputs(model_type)
+        self._initialized = True
+    
+    def _get_tensor_inputs(self, model_type):
+        if model_type in ['flux', 'sd3']:
+            return ["latents", "prompt_embeds"]
+        if model_type == 'sdxl':
+            return ["latents"]
 
-    def _make_hook(self, layer_path: str, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None):
+    def _get_net(self, model_type):
+        if model_type in ['flux', 'sd3']:
+            return 'transformer'
+        if model_type == 'sdxl':
+            return 'unet'
+
+    def _get_mask_placeholder(self, model_type):
+        if model_type in ['flux', 'sd3']:
+            return "<pad>"
+        if model_type == 'sdxl':
+            return "<|endoftext|>"
+
+    def _get_target_layer_prefix(self, model_type):
+        # 修复：SD3.5 同样使用 transformer_blocks
+        if model_type in ['flux', 'sd3']:
+            return "transformer_blocks"
+        if model_type == 'sdxl':
+            return "down_blocks.1"
+
+    def _get_general_layer_prefix(self, model_type):
+        # 修复：SD3.5 同样使用 transformer_blocks
+        if model_type in ['flux', 'sd3']:
+            return "transformer_blocks"
+        if model_type == 'sdxl':
+            return "down_blocks"
+
+    def _make_hook(self, layer_path: str, key_type: str, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None):
         def hook(module, inputs, outputs):
             tensor = inputs[0]
-            if "to_q" in layer_path:
-                self._maybe_inject(tensor, layer_path, "q", modify, active_steps)
-                self.q[layer_path] = {"input": tensor.detach().cpu(), "output": outputs.detach().cpu()}
-            elif "to_k" in layer_path:
-                self._maybe_inject(tensor, layer_path, "k", modify, active_steps)
-                self.k[layer_path] = {"input": tensor.detach().cpu(), "output": outputs.detach().cpu()}
-            elif "to_v" in layer_path:
-                self._maybe_inject(tensor, layer_path, "v", modify, active_steps)
-                self.v[layer_path] = {"input": tensor.detach().cpu(), "output": outputs.detach().cpu()}
-
+            self._maybe_inject(tensor, layer_path, key_type, modify, active_steps)
+            
+            target_dict = getattr(self, key_type)
+            target_dict[layer_path] = {"input": tensor.detach().cpu(), "output": outputs.detach().cpu()}
         return hook
 
     def _maybe_inject(self, tensor, layer_path, key, modify, active_steps):
@@ -91,22 +114,6 @@ class CrossAttentionCapture:
             return
         tensor.data.add_(delta.to(tensor.device) * strength)
 
-    def attach(self, unet, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None) -> None:
-        active_steps = active_steps or []
-        for bidx, down_block in enumerate(unet.down_blocks):
-            if not hasattr(down_block, "attentions"):
-                continue
-            for aidx, attention in enumerate(down_block.attentions):
-                for tidx, transformer in enumerate(attention.transformer_blocks):
-                    attn2 = transformer.attn2
-                    base = f"down_blocks.{bidx}.attentions.{aidx}.transformer_blocks.{tidx}.attn2"
-                    for name in ["to_q", "to_k", "to_v"]:
-                        layer_path = f"{base}.{name}"
-                        hook = getattr(attn2, name).register_forward_hook(
-                            self._make_hook(layer_path, modify, active_steps)
-                        )
-                        self.hooks.append(hook)
-
     def remove(self) -> None:
         for hook in self.hooks:
             hook.remove()
@@ -120,9 +127,141 @@ class CrossAttentionCapture:
             self.v.clear()
         return payload
 
+    def attach(self, model: Any, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None) -> None:
+        raise NotImplementedError()
+
+    def attention_qk(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError()
+
+    def load_tokenizers(self, model_path: str):
+        raise NotImplementedError()
+
+
+class SDXLCapture(BaseCrossAttentionCapture):
+    def attach(self, model: Any, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None) -> None:
+        active_steps = active_steps or []
+        for bidx, down_block in enumerate(model.down_blocks):
+            if not hasattr(down_block, "attentions"):
+                continue
+            for aidx, attention in enumerate(down_block.attentions):
+                for tidx, transformer in enumerate(attention.transformer_blocks):
+                    attn2 = transformer.attn2
+                    base = f"down_blocks.{bidx}.attentions.{aidx}.transformer_blocks.{tidx}.attn2"
+                    
+                    self.hooks.append(attn2.to_q.register_forward_hook(self._make_hook(f"{base}.to_q", "q", modify, active_steps)))
+                    self.hooks.append(attn2.to_k.register_forward_hook(self._make_hook(f"{base}.to_k", "k", modify, active_steps)))
+                    self.hooks.append(attn2.to_v.register_forward_hook(self._make_hook(f"{base}.to_v", "v", modify, active_steps)))
+
+    def attention_qk(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
+        q = query.to(torch.float32)
+        k = key.to(torch.float32)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+        scores = scores - scores.max(dim=-1, keepdim=True).values
+        probs = torch.softmax(scores, dim=-1)
+        return torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
+
+    def load_tokenizers(self, model_path: str):
+        if CLIPTokenizer is None:
+            return None, None
+        tok1 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer", local_files_only=True)
+        tok2 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", local_files_only=True)
+        return tok1, tok2
+
+
+class FluxCapture(BaseCrossAttentionCapture):
+    def attach(self, model: Any, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None) -> None:
+        active_steps = active_steps or []
+        for tidx, block in enumerate(model.transformer_blocks):
+            attn = block.attn
+            base = f"transformer_blocks.{tidx}.attn"
+            
+            self.hooks.append(attn.to_q.register_forward_hook(self._make_hook(f"{base}.to_q", "q", modify, active_steps)))
+            self.hooks.append(attn.add_k_proj.register_forward_hook(self._make_hook(f"{base}.add_k_proj", "k", modify, active_steps)))
+            self.hooks.append(attn.add_v_proj.register_forward_hook(self._make_hook(f"{base}.add_v_proj", "v", modify, active_steps)))
+
+    def attention_qk(self, query: torch.Tensor, key: torch.Tensor, head_dim: int = 64) -> torch.Tensor:
+        q = query.to(torch.float32)
+        k = key.to(torch.float32)
+        
+        b, sq, d = q.shape
+        _, sk, _ = k.shape
+        heads = d // head_dim 
+        
+        q = q.view(b, sq, heads, head_dim).transpose(1, 2)
+        k = k.view(b, sk, heads, head_dim).transpose(1, 2)
+        
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        scores = scores - scores.max(dim=-1, keepdim=True).values
+        probs = torch.softmax(scores, dim=-1)
+        
+        probs = probs.mean(dim=1) 
+        return torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
+
+    def load_tokenizers(self, model_path: str):
+        if CLIPTokenizer is None:
+            return None, None
+        tok1 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer", local_files_only=True)
+        if T5TokenizerFast is None:
+            raise ImportError("加载 FLUX 需要 T5TokenizerFast。")
+        tok2 = T5TokenizerFast.from_pretrained(model_path, subfolder="tokenizer_2", local_files_only=True)
+        return tok1, tok2
+
+
+class SD3Capture(BaseCrossAttentionCapture):
+    """
+    [SD3.5 适配] Stable Diffusion 3 / 3.5 模型的注意力捕获子类。
+    """
+    def attach(self, model: Any, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None) -> None:
+        active_steps = active_steps or []
+        
+        # 修复：经过上一步探测，SD3.5 在 Diffusers 中的变量名依然是 transformer_blocks
+        for tidx, block in enumerate(model.transformer_blocks):
+            attn = block.attn
+            base = f"transformer_blocks.{tidx}.attn"
+            
+            self.hooks.append(attn.to_q.register_forward_hook(self._make_hook(f"{base}.to_q", "q", modify, active_steps)))
+            self.hooks.append(attn.add_k_proj.register_forward_hook(self._make_hook(f"{base}.add_k_proj", "k", modify, active_steps)))
+            self.hooks.append(attn.add_v_proj.register_forward_hook(self._make_hook(f"{base}.add_v_proj", "v", modify, active_steps)))
+
+    def attention_qk(self, query: torch.Tensor, key: torch.Tensor, head_dim: int = 64) -> torch.Tensor:
+        # SD3 多头注意力计算 (与 FLUX 计算方式相同，动态推断 Heads)
+        q = query.to(torch.float32)
+        k = key.to(torch.float32)
+        
+        b, sq, d = q.shape
+        _, sk, _ = k.shape
+        heads = d // head_dim 
+        
+        q = q.view(b, sq, heads, head_dim).transpose(1, 2)
+        k = k.view(b, sk, heads, head_dim).transpose(1, 2)
+        
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        scores = scores - scores.max(dim=-1, keepdim=True).values
+        probs = torch.softmax(scores, dim=-1)
+        
+        probs = probs.mean(dim=1) 
+        return torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
+
+    def load_tokenizers(self, model_path: str):
+        if CLIPTokenizer is None:
+            return None, None
+        tok1 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer", local_files_only=True)
+        tok2 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", local_files_only=True)
+        return tok1, tok2
+
+
+MODEL_TO_CLASS = {
+    'flux': FluxCapture,
+    'sdxl': SDXLCapture,
+    'sd3': SD3Capture
+}
+
+# ==========================================
+# 2. 回调函数改造
+# ==========================================
 
 class StepCallback:
-    def __init__(self, attn_cap: CrossAttentionCapture, total_steps: int = 30):
+    def __init__(self, attn_cap: BaseCrossAttentionCapture, total_steps: int = 30):
         self.attn_cap = attn_cap
         self.total_steps = total_steps
         self.steps: Dict[int, Dict] = {}
@@ -133,15 +272,34 @@ class StepCallback:
         weights = {}
         q_record = {}
         k_record = {}
-        q_keys = list(records["q"].keys())
-        k_keys = list(records["k"].keys())
-        for idx in range(min(len(q_keys), len(k_keys))):
-            q = records["q"][q_keys[idx]]["output"]
-            k = records["k"][k_keys[idx]]["output"]
-            weights[q_keys[idx][:-5]] = attention_qk(q, k)[1:, :, :]
-            q_record[q_keys[idx][:-5]] = q[1:, :, :]
-            k_record[k_keys[idx][:-5]] = k[1:, :, :]
-        latents = kwargs.get("latents")
+        
+        # 【修改点 1】：直接遍历 q 字典的键，而不是用列表索引
+        for q_key, q_data in records["q"].items():
+            # 获取当前层的基础名字 (例如 "transformer_blocks.0.attn")
+            base_name = q_key.replace(".to_q", "") 
+            
+            # 【修改点 2】：动态探测对应的 K 层名字，兼容不同架构
+            if f"{base_name}.to_k" in records["k"]:
+                k_key = f"{base_name}.to_k"          # 适配 SDXL / SD1.5
+            elif f"{base_name}.add_k_proj" in records["k"]:
+                k_key = f"{base_name}.add_k_proj"    # 适配 FLUX / SD3.5
+            else:
+                continue # 如果找不到对应的 K，为了安全直接跳过
+                
+            q = q_data["output"]
+            k = records["k"][k_key]["output"]
+            
+            # 兼容 CFG(B=2) 和 Non-CFG(B=1)
+            q_cond = q[-1:]
+            k_cond = k[-1:]
+            
+            # 通过多态调用各自架构的 attention 计算
+            weights[base_name] = self.attn_cap.attention_qk(q_cond, k_cond)
+            q_record[base_name] = q_cond
+            k_record[base_name] = k_cond
+            
+        latents = kwargs.get("latents", kwargs.get("hidden_states"))
+        
         self.steps[step] = {
             "step": step,
             "timestep": int(timestep.item()) if hasattr(timestep, "item") else int(timestep),
@@ -152,200 +310,109 @@ class StepCallback:
         }
         return kwargs
 
+# ==========================================
+# 4. 测试与验证 Main 函数
+# ==========================================
 
-def compute_concept_k_mean(step_data: Dict[int, Dict], layer_names: List[str], indices: List[int]) -> float:
-    if not indices:
-        return 0.0
-    steps = sorted(step_data.keys())
-    values = []
-    for step in steps:
-        for name in layer_names:
-            attn = step_data[step]["attention_weights"].get(name)
-            if attn is None:
-                continue
-            mass = attn.sum(dim=1)
-            valid_idx = [idx for idx in indices if idx < mass.shape[-1]]
-            if not valid_idx:
-                continue
-            values.append(float(mass.mean(dim=0)[valid_idx].mean().detach().cpu()))
-    return float(sum(values) / len(values)) if values else 0.0
+def run_test(model_type: str):
+    """一键跑通测试函数，支持 'flux', 'sdxl', 或 'sd3'"""
+    import torch
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    prompt = "A futuristic city with flying cars, highly detailed"
+    steps_to_run = 2
 
-
-def compute_attention_mean(step_data: Dict[int, Dict], layer_names: List[str], indices: List[int]):
-    if not indices:
-        return []
-    steps = sorted(step_data.keys())
-    results = []
-    for step in steps:
-        collected = {}
-        for name in layer_names:
-            attn = step_data[step]["attention_weights"].get(name)
-            if attn is None or "down_blocks.2" in name:
-                continue
-            valid_idx = [idx for idx in indices if idx < attn.shape[-1]]
-            if not valid_idx:
-                continue
-            attn_selected = attn[:, :, valid_idx]
-            collected[name] = attn_selected.mean(dim=2)[0, :]
-        if collected:
-            results.append(collected)
-    return results
-
-
-def extract_concepts(prompt: str) -> List[str]:
-    text = prompt.lower()
-    words = re.findall(r"[a-z]+", text)
-    stops = {"their", "this", "that"}
-    unigrams = [w for w in words if w not in stops]
-    bigrams = []
-    for idx in range(len(words) - 1):
-        w1, w2 = words[idx], words[idx + 1]
-        if w1 in stops or w2 in stops:
-            continue
-        phrase = f"{w1} {w2}"
-        if phrase in text:
-            bigrams.append(phrase)
-    seen = set()
-    results: List[str] = []
-    for token in bigrams + unigrams:
-        if token not in seen:
-            seen.add(token)
-            results.append(token)
-    return results
-
-
-def _clean_token(token: str) -> str:
-    token = token.lower()
-    for bad in ["</w>", "Ġ", "##", "Ċ", "｡", "▁"]:
-        token = token.replace(bad, "")
-    return re.sub(r"[^a-z]+", "", token)
-
-
-def load_tokenizers(model_path: str):
-    if CLIPTokenizer is None:
-        return None, None
-    tok1 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer", local_files_only=True)
-    tok2 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", local_files_only=True)
-    return tok1, tok2
-
-
-def tokens_from_prompt(tokenizer, prompt: str) -> List[str]:
-    ids = tokenizer(prompt, return_tensors="pt").input_ids[0].tolist()
-    tokens = tokenizer.convert_ids_to_tokens(ids)
-    return tokens
-
-
-def map_concepts_to_indices(tok1, tok2, prompt: str, concepts: List[str], max_tokens: int) -> Dict[str, List[int]]:
-    if tok1 is None or tok2 is None:
-        return {concept: [] for concept in concepts}
-    t1 = [_clean_token(x) for x in tokens_from_prompt(tok1, prompt)]
-    t2 = [_clean_token(x) for x in tokens_from_prompt(tok2, prompt)]
-    total = min(max_tokens, len(t1) + len(t2))
-    mapping: Dict[str, List[int]] = {concept: [] for concept in concepts}
-    for concept in concepts:
-        parts = [_clean_token(x) for x in re.findall(r"[a-z]+", concept)]
-        for idx, word in enumerate(t1):
-            if idx >= total:
-                break
-            if any(p and p in word for p in parts):
-                mapping[concept].append(idx)
-        for idx, word in enumerate(t2):
-            real_idx = len(t1) + idx
-            if real_idx >= total:
-                break
-            if any(p and p in word for p in parts):
-                mapping[concept].append(real_idx)
-    return mapping
-
-
-def mask_prompt_with_missing(prompt: str, missing_terms: List[str], placeholder: str = "<pad><pad><pad>") -> str:
-    masked = prompt
-    for term in sorted(missing_terms, key=len, reverse=True):
-        if not term or term not in masked:
-            continue
-        pieces = term.split(" ")
-        replacement = " ".join([placeholder] * len(pieces))
-        masked = masked.replace(term, replacement)
-    return masked
-
-
-def collect_k_mean(attn_ref: Dict[str, Dict[str, torch.Tensor]]) -> torch.Tensor:
-    k_inputs = [value["input"] for value in attn_ref.values()]
-    if not k_inputs:
-        raise ValueError("未捕获到任何 K 输入")
-    return torch.stack(k_inputs, dim=0).mean(dim=0)
-
-
-def gather_indices(idx_map: Dict[str, List[int]], concepts: List[str], exclude: Optional[List[str]] = None) -> List[int]:
-    exclude = set(exclude or [])
-    indices = sorted({idx for concept in concepts if concept not in exclude for idx in idx_map.get(concept, [])})
-    return indices
-
-
-def pil_to_data_url(image: Image.Image) -> str:
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    content = base64.b64encode(buffer.getvalue()).decode()
-    return f"data:image/png;base64,{content}"
-
-
-def _norm_words(text: str) -> List[str]:
-    return re.findall(r"[a-z]+", text.lower())
-
-
-def analyze_present_missing(image: Image.Image, prompt: str, top_k: int = 8) -> Tuple[List[str], List[str]]:
-    api_key = os.getenv("DASHSCOPE_API_KEY")
-    if not api_key or OpenAI is None:
-        return [], []
-    api_base_url = os.getenv("VLM_API_BASE_URL")
-    if not api_base_url:
-        return [], []
-    client = OpenAI(api_key=api_key, base_url=api_base_url)
-    data_url = pil_to_data_url(image)
-    instruction = f"""
-You are a vision QA tool. Compare the image with this text prompt:
-PROMPT:
-{prompt}
-
-Task:
-1) List up to {top_k} concept words or short phrases clearly present.
-2) List up to {top_k} tokens missing or under-represented.
-Rules:
-- Use exact words from PROMPT only.
-- Return strict JSON with present_tokens, missing_tokens.
-"""
-    try:
-        response = client.chat.completions.create(
-            model=os.getenv("QWEN_VL_MODEL", "qwen3-vl-plus"),
-            messages=[
-                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": data_url}}, {"type": "text", "text": instruction}]}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
+    if model_type == "flux":
+        from diffusers import FluxPipeline
+        print("\n" + "="*50)
+        print("▶ 开始测试 FLUX 架构 (极限省显存 Debug 模式)...")
+        # 如果你本地有之前下载好的缓存路径，请替换掉它
+        model_path = "black-forest-labs/FLUX.1-dev"
+        
+        # 【省显存招式 1】：千万不要写 .to(device)!
+        pipe = FluxPipeline.from_pretrained(
+            model_path, 
+            torch_dtype=torch.bfloat16
+            # FLUX 强依赖 T5，所以我们不把它设为 None，而是让它待在内存里
         )
-        payload = json.loads(response.choices[0].message.content)
-        raw_present = [t.strip().lower() for t in payload.get("present_tokens", []) if isinstance(t, str)]
-        raw_missing = [t.strip().lower() for t in payload.get("missing_tokens", []) if isinstance(t, str)]
-    except Exception:
-        return [], []
-    prompt_words = set(_norm_words(prompt))
-    prompt_bigrams = set([" ".join(x) for x in zip(_norm_words(prompt)[:-1], _norm_words(prompt)[1:])])
+        
+        # 【省显存招式 2】：开启模型层面的 CPU 卸载
+        # 这会将 FLUX 巨大的 Transformer 和 T5 放在系统内存中，
+        # 只有在具体运算某一层时，才把它“搬”进显存，算完立刻“搬”出去。
+        pipe.enable_model_cpu_offload() 
+        # (同样，如果遇到极端情况还是爆显存，可以使用 pipe.enable_sequential_cpu_offload() )
 
-    def filter_terms(tokens: List[str]) -> List[str]:
-        filtered = []
-        for token in tokens:
-            words = _norm_words(token)
-            keep = False
-            if len(words) == 1:
-                word = words[0] if words else ""
-                if word and (word in prompt_words or word.rstrip("s") in prompt_words):
-                    keep = True
-            else:
-                phrase = " ".join(words)
-                if phrase in prompt_bigrams or all(word in prompt_words for word in words):
-                    keep = True
-            if keep and token not in filtered:
-                filtered.append(token)
-        return filtered[:top_k]
+        attn_cap = FluxCapture("flux")
+        target_model = pipe.transformer
+        
+    elif model_type == "sdxl":
+        from diffusers import StableDiffusionXLPipeline
+        print("\n" + "="*50)
+        print("▶ 开始测试 SDXL 架构...")
+        model_path = "stabilityai/stable-diffusion-xl-base-1.0" 
+        pipe = StableDiffusionXLPipeline.from_pretrained(model_path, torch_dtype=torch.float16).to(device)
+        attn_cap = SDXLCapture("sdxl")
+        target_model = pipe.unet 
 
-    return filter_terms(raw_present), filter_terms(raw_missing)
+    elif model_type == "sd3":
+        from diffusers import StableDiffusion3Pipeline
+        print("\n" + "="*50)
+        print("▶ 开始测试 SD3.5 架构 (极限省显存 Debug 模式)...")
+        model_path = "stabilityai/stable-diffusion-3.5-medium" 
+        
+        pipe = StableDiffusion3Pipeline.from_pretrained(
+            model_path, 
+            torch_dtype=torch.bfloat16,
+            text_encoder_3=None, 
+            tokenizer_3=None
+        )
+        
+        pipe.enable_model_cpu_offload() 
+
+        attn_cap = SD3Capture("sd3")
+        target_model = pipe.transformer
+        
+    else:
+        raise ValueError("不支持的模型类型")
+
+    attn_cap.attach(target_model, active_steps=[1, 2])
+    callback = StepCallback(attn_cap, total_steps=steps_to_run)
+    
+    print(f"正在生成图像，步数: {steps_to_run}")
+    try:
+        pipe(
+            prompt=prompt,
+            num_inference_steps=steps_to_run,
+            height=256, width=256, 
+            callback_on_step_end=callback,
+            callback_on_step_end_tensor_inputs=attn_cap.tensor_inputs 
+        )
+        captured_steps = list(callback.steps.keys())
+        if captured_steps:
+            step_data = callback.steps[captured_steps[0]]
+            layers = list(step_data["attention_weights"].keys())
+            print(f"✅ [{model_type.upper()}] 测试成功！")
+            print(f"   捕获到的步骤数: {len(captured_steps)}")
+            print(f"   捕获到的层级数: {len(layers)}")
+            if layers:
+                print(f"   示例层级: {layers[0]}")
+                print(f"   Attention 矩阵形状: {step_data['attention_weights'][layers[0]].shape}")
+    except Exception as e:
+        print(f"❌ 运行报错: {e}")
+    finally:
+        attn_cap.remove()
+        del pipe
+        torch.cuda.empty_cache()
+        print("="*50)
+
+if __name__ == "__main__":
+    TEST_FLUX = True
+    TEST_SDXL = False
+    TEST_SD3 = False
+
+    if TEST_FLUX:
+        run_test("flux")
+    if TEST_SDXL:
+        run_test("sdxl")
+    if TEST_SD3:
+        run_test("sd3")

@@ -30,22 +30,17 @@ class BaseCrossAttentionCapture:
     处理数据存储、Hook 管理、特征注入等通用逻辑。
     """
     def __new__(cls, model_type: str, *args, **kwargs):
-        # 只有在直接实例化 BaseCrossAttentionCapture 时，才进行路由分发
         if cls is BaseCrossAttentionCapture:
-            # 这里的 MODEL_TO_CLASS 字典定义在文件末尾，确保子类已经加载
             if model_type not in MODEL_TO_CLASS:
                 raise ValueError(f"不支持的模型类型: '{model_type}'。支持的类型有: {list(MODEL_TO_CLASS.keys())}")
             
             target_class = MODEL_TO_CLASS[model_type]
-            # 创建并返回目标子类的实例
             instance = super().__new__(target_class)
             return instance
             
-        # 如果是子类自己被实例化（比如直接调用 FluxCapture()），则走正常流程
         return super().__new__(cls)
 
     def __init__(self, model_type: str) -> None:
-        # 添加一个保护机制，防止 __init__ 被调用两次
         if getattr(self, "_initialized", False):
             return
             
@@ -55,12 +50,46 @@ class BaseCrossAttentionCapture:
         self.hooks: List[torch.utils.hooks.RemovableHandle] = []
         self.step = 0
         self.model_type = model_type
-        
+        self.target_layer_prefix = self._get_target_layer_prefix(model_type)
+        self.general_layer_prefix = self._get_general_layer_prefix(model_type)
+        self.mask_placeholder = self._get_mask_placeholder(model_type)
+        self.net = self._get_net(model_type)
+        self.tensor_inputs = self._get_tensor_inputs(model_type)
         self._initialized = True
-        
+    
+    def _get_tensor_inputs(self, model_type):
+        if model_type in ['flux', 'sd3']:
+            return ["latents", "prompt_embeds"]
+        if model_type == 'sdxl':
+            return ["latents"]
+
+    def _get_net(self, model_type):
+        if model_type in ['flux', 'sd3']:
+            return 'transformer'
+        if model_type == 'sdxl':
+            return 'unet'
+
+    def _get_mask_placeholder(self, model_type):
+        if model_type in ['flux', 'sd3']:
+            return "<pad>"
+        if model_type == 'sdxl':
+            return "<|endoftext|>"
+
+    def _get_target_layer_prefix(self, model_type):
+        # 修复：SD3.5 同样使用 transformer_blocks
+        if model_type in ['flux', 'sd3']:
+            return "transformer_blocks"
+        if model_type == 'sdxl':
+            return "down_blocks.1"
+
+    def _get_general_layer_prefix(self, model_type):
+        # 修复：SD3.5 同样使用 transformer_blocks
+        if model_type in ['flux', 'sd3']:
+            return "transformer_blocks"
+        if model_type == 'sdxl':
+            return "down_blocks"
 
     def _make_hook(self, layer_path: str, key_type: str, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None):
-        """通用的 Hook 工厂函数，通过 key_type ('q', 'k', 'v') 决定存储位置"""
         def hook(module, inputs, outputs):
             tensor = inputs[0]
             self._maybe_inject(tensor, layer_path, key_type, modify, active_steps)
@@ -70,7 +99,6 @@ class BaseCrossAttentionCapture:
         return hook
 
     def _maybe_inject(self, tensor, layer_path, key, modify, active_steps):
-        """通用的特征注入逻辑"""
         if not modify or key not in modify or not modify[key].get("signal", False) or not active_steps or self.step not in active_steps:
             return
         config = modify[key]
@@ -87,13 +115,11 @@ class BaseCrossAttentionCapture:
         tensor.data.add_(delta.to(tensor.device) * strength)
 
     def remove(self) -> None:
-        """卸载所有 Hook"""
         for hook in self.hooks:
             hook.remove()
         self.hooks.clear()
 
     def take(self, clear: bool = True):
-        """提取本 Step 收集到的所有张量"""
         payload = {"q": self.q.copy(), "k": self.k.copy(), "v": self.v.copy()}
         if clear:
             self.q.clear()
@@ -101,21 +127,18 @@ class BaseCrossAttentionCapture:
             self.v.clear()
         return payload
 
-    # --------- 需要子类实现的方法 ---------
     def attach(self, model: Any, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None) -> None:
-        raise NotImplementedError("子类必须实现 attach 方法，以挂载到特定架构的层上。")
+        raise NotImplementedError()
 
     def attention_qk(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("子类必须实现具体的 Attention 计算逻辑。")
+        raise NotImplementedError()
 
     def load_tokenizers(self, model_path: str):
-        raise NotImplementedError("子类必须实现具体的 Attention 计算逻辑。")
+        raise NotImplementedError()
+
+
 class SDXLCapture(BaseCrossAttentionCapture):
-    """
-    [SDXL 适配] SDXL 模型的注意力捕获子类。
-    """
     def attach(self, model: Any, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None) -> None:
-        # 兼容你的原始逻辑：挂载到 UNet 的 down_blocks
         active_steps = active_steps or []
         for bidx, down_block in enumerate(model.down_blocks):
             if not hasattr(down_block, "attentions"):
@@ -130,32 +153,23 @@ class SDXLCapture(BaseCrossAttentionCapture):
                     self.hooks.append(attn2.to_v.register_forward_hook(self._make_hook(f"{base}.to_v", "v", modify, active_steps)))
 
     def attention_qk(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
-        # SDXL 标准注意力计算 (不切分 Head 的近似计算)
         q = query.to(torch.float32)
         k = key.to(torch.float32)
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
         scores = scores - scores.max(dim=-1, keepdim=True).values
         probs = torch.softmax(scores, dim=-1)
         return torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
+
     def load_tokenizers(self, model_path: str):
-        """
-        动态加载 Tokenizer。
-        SDXL: Tokenizer1 (CLIP), Tokenizer2 (CLIP)
-        FLUX: Tokenizer1 (CLIP), Tokenizer2 (T5)
-        """
         if CLIPTokenizer is None:
             return None, None
-        # 第一文本编码器：SDXL 和 FLUX 都是 CLIP
         tok1 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer", local_files_only=True)
         tok2 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", local_files_only=True)
         return tok1, tok2
 
+
 class FluxCapture(BaseCrossAttentionCapture):
-    """
-    [FLUX 适配] FLUX.1 模型的注意力捕获子类。
-    """
     def attach(self, model: Any, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None) -> None:
-        # 挂载到 Transformer 的双流 transformer_blocks
         active_steps = active_steps or []
         for tidx, block in enumerate(model.transformer_blocks):
             attn = block.attn
@@ -165,14 +179,13 @@ class FluxCapture(BaseCrossAttentionCapture):
             self.hooks.append(attn.add_k_proj.register_forward_hook(self._make_hook(f"{base}.add_k_proj", "k", modify, active_steps)))
             self.hooks.append(attn.add_v_proj.register_forward_hook(self._make_hook(f"{base}.add_v_proj", "v", modify, active_steps)))
 
-    def attention_qk(self, query: torch.Tensor, key: torch.Tensor, heads: int = 24) -> torch.Tensor:
-        # FLUX 多头注意力计算 (先切分 Head，计算后取平均)
+    def attention_qk(self, query: torch.Tensor, key: torch.Tensor, head_dim: int = 64) -> torch.Tensor:
         q = query.to(torch.float32)
         k = key.to(torch.float32)
         
         b, sq, d = q.shape
         _, sk, _ = k.shape
-        head_dim = d // heads
+        heads = d // head_dim 
         
         q = q.view(b, sq, heads, head_dim).transpose(1, 2)
         k = k.view(b, sk, heads, head_dim).transpose(1, 2)
@@ -181,33 +194,73 @@ class FluxCapture(BaseCrossAttentionCapture):
         scores = scores - scores.max(dim=-1, keepdim=True).values
         probs = torch.softmax(scores, dim=-1)
         
-        probs = probs.mean(dim=1) # 合并所有 Head 的响应
+        probs = probs.mean(dim=1) 
         return torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
+
     def load_tokenizers(self, model_path: str):
         if CLIPTokenizer is None:
             return None, None
-            
-        # 第一文本编码器：SDXL 和 FLUX 都是 CLIP
         tok1 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer", local_files_only=True)
-        
-        # 第二文本编码器：根据架构动态分发
         if T5TokenizerFast is None:
-            raise ImportError("加载 FLUX 需要 T5TokenizerFast，请确保安装了正确的 transformers 版本。")
+            raise ImportError("加载 FLUX 需要 T5TokenizerFast。")
         tok2 = T5TokenizerFast.from_pretrained(model_path, subfolder="tokenizer_2", local_files_only=True)
+        return tok1, tok2
+
+
+class SD3Capture(BaseCrossAttentionCapture):
+    """
+    [SD3.5 适配] Stable Diffusion 3 / 3.5 模型的注意力捕获子类。
+    """
+    def attach(self, model: Any, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None) -> None:
+        active_steps = active_steps or []
+        
+        # 修复：经过上一步探测，SD3.5 在 Diffusers 中的变量名依然是 transformer_blocks
+        for tidx, block in enumerate(model.transformer_blocks):
+            attn = block.attn
+            base = f"transformer_blocks.{tidx}.attn"
             
+            self.hooks.append(attn.to_q.register_forward_hook(self._make_hook(f"{base}.to_q", "q", modify, active_steps)))
+            self.hooks.append(attn.add_k_proj.register_forward_hook(self._make_hook(f"{base}.add_k_proj", "k", modify, active_steps)))
+            self.hooks.append(attn.add_v_proj.register_forward_hook(self._make_hook(f"{base}.add_v_proj", "v", modify, active_steps)))
+
+    def attention_qk(self, query: torch.Tensor, key: torch.Tensor, head_dim: int = 64) -> torch.Tensor:
+        # SD3 多头注意力计算 (与 FLUX 计算方式相同，动态推断 Heads)
+        q = query.to(torch.float32)
+        k = key.to(torch.float32)
+        
+        b, sq, d = q.shape
+        _, sk, _ = k.shape
+        heads = d // head_dim 
+        
+        q = q.view(b, sq, heads, head_dim).transpose(1, 2)
+        k = k.view(b, sk, heads, head_dim).transpose(1, 2)
+        
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        scores = scores - scores.max(dim=-1, keepdim=True).values
+        probs = torch.softmax(scores, dim=-1)
+        
+        probs = probs.mean(dim=1) 
+        return torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
+
+    def load_tokenizers(self, model_path: str):
+        if CLIPTokenizer is None:
+            return None, None
+        tok1 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer", local_files_only=True)
+        tok2 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", local_files_only=True)
         return tok1, tok2
 
 
 MODEL_TO_CLASS = {
     'flux': FluxCapture,
-    'sdxl': SDXLCapture
+    'sdxl': SDXLCapture,
+    'sd3': SD3Capture
 }
+
 # ==========================================
 # 2. 回调函数改造
 # ==========================================
 
 class StepCallback:
-    """通用回调函数，接收任何 BaseCrossAttentionCapture 的子类"""
     def __init__(self, attn_cap: BaseCrossAttentionCapture, total_steps: int = 30):
         self.attn_cap = attn_cap
         self.total_steps = total_steps
@@ -220,26 +273,31 @@ class StepCallback:
         q_record = {}
         k_record = {}
         
-        q_keys = list(records["q"].keys())
-        k_keys = list(records["k"].keys())
-        
-        for idx in range(min(len(q_keys), len(k_keys))):
-            q = records["q"][q_keys[idx]]["output"]
-            k = records["k"][k_keys[idx]]["output"]
+        # 【修改点 1】：直接遍历 q 字典的键，而不是用列表索引
+        for q_key, q_data in records["q"].items():
+            # 获取当前层的基础名字 (例如 "transformer_blocks.0.attn")
+            base_name = q_key.replace(".to_q", "") 
             
-            # 清理后缀以获取准确层名
-            layer_name = q_keys[idx].replace(".to_q", "") 
+            # 【修改点 2】：动态探测对应的 K 层名字，兼容不同架构
+            if f"{base_name}.to_k" in records["k"]:
+                k_key = f"{base_name}.to_k"          # 适配 SDXL / SD1.5
+            elif f"{base_name}.add_k_proj" in records["k"]:
+                k_key = f"{base_name}.add_k_proj"    # 适配 FLUX / SD3.5
+            else:
+                continue # 如果找不到对应的 K，为了安全直接跳过
+                
+            q = q_data["output"]
+            k = records["k"][k_key]["output"]
             
             # 兼容 CFG(B=2) 和 Non-CFG(B=1)
             q_cond = q[-1:]
             k_cond = k[-1:]
             
-            # 【核心修改】：通过多态调用各自架构的 attention 计算
-            weights[layer_name] = self.attn_cap.attention_qk(q_cond, k_cond)
-            q_record[layer_name] = q_cond
-            k_record[layer_name] = k_cond
+            # 通过多态调用各自架构的 attention 计算
+            weights[base_name] = self.attn_cap.attention_qk(q_cond, k_cond)
+            q_record[base_name] = q_cond
+            k_record[base_name] = k_cond
             
-        # 兼容不同模型的潜变量命名
         latents = kwargs.get("latents", kwargs.get("hidden_states"))
         
         self.steps[step] = {

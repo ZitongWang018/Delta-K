@@ -6,7 +6,10 @@ import os
 
 CONFIG = {
     "model": {
-        "base_path": os.environ.get("DELTA_K_MODEL_PATH", "/data/yulin/hf_cache/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b/"),
+        "base_path": os.environ.get("DELTA_K_MODEL_PATH", "/data/yulin/hf_cache/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b"),
+        "base_path": os.environ.get("DELTA_K_MODEL_PATH", "/data/yulin/hf_cache/hub/models--stabilityai--stable-diffusion-3.5-medium/snapshots/b940f670f0eda2d07fbb75229e779da1ad11eb80"),
+        "base_path": os.environ.get("DELTA_K_MODEL_PATH", "/data/yulin/hf_cache/hub/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21"),
+        "model_type": "flux",
     },
     "data": {
         "prompt_file": None,
