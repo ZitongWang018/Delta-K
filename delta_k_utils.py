@@ -15,10 +15,9 @@ except Exception:
     CLIPTokenizer = None
     T5TokenizerFast = None
 
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
+
+from openai import OpenAI
+
 
 # ==========================================
 # 1. 核心架构：面向对象的 Attention Capture
@@ -444,25 +443,42 @@ def _norm_words(text: str) -> List[str]:
 
 
 def analyze_present_missing(image: Image.Image, prompt: str, top_k: int = 8) -> Tuple[List[str], List[str]]:
-    api_key = os.getenv("DASHSCOPE_API_KEY")
+    api_key = "sk-6b8c3387f0374255ab6adb1211382810"
     if not api_key or OpenAI is None:
+        print(1)
         return [], []
-    api_base_url = os.getenv("VLM_API_BASE_URL")
+    api_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     if not api_base_url:
+        print(2)
         return [], []
     client = OpenAI(api_key=api_key, base_url=api_base_url)
     data_url = pil_to_data_url(image)
     instruction = f"""
-You are a vision QA tool. Compare the image with this text prompt:
-PROMPT:
-{prompt}
+You are a high-precision vision QA tool. Your task is to verify the visual fidelity of an image against a specific text prompt by focusing on concrete entities and their immediate modifiers.
 
-Task:
-1) List up to {top_k} concept words or short phrases clearly present.
-2) List up to {top_k} tokens missing or under-represented.
-Rules:
-- Use exact words from PROMPT only.
-- Return strict JSON with present_tokens, missing_tokens.
+**PROMPT:** {prompt}
+
+**EVALUATION STEPS:**
+1. **Entity-Attribute Extraction:** Deconstruct the prompt into specific nouns or short "modifier-noun" phrases (e.g., "vintage clock," "golden retriever," "marble floor"). Ignore broad actions or complex clauses.
+2. **Visual Strictness Check:** For each extracted phrase, verify if the visual evidence EXACTLY matches every word in that phrase.
+    - *Constraint:* If the prompt specifies a "transparent glass bottle" and the image shows an "opaque plastic bottle," the phrase is marked as missing.
+3. **Reasoning:** Evaluate whether the specific physical attributes (color, texture, material, quantity, relative position) described are visibly evident.
+
+**TASK:**
+1. **present_tokens:** List up to {top_k} noun-based phrases or entities from the PROMPT where all modifiers are correctly and clearly depicted.
+2. **missing_tokens:** List up to {top_k} noun-based phrases or entities from the PROMPT that are absent, have incorrect modifiers (e.g., wrong color/material), or are visually ambiguous.
+
+**STRICT RULES:**
+- **Focus:** Extract ONLY nouns or short [Adjective/Modifier] + [Noun] structures. Avoid long sentences or verbs.
+- **Exact Match:** Use the EXACT wording from the PROMPT. No paraphrasing.
+- **Strict Logic:** Be hyper-critical of modifiers. If a "blue silk tie" is shown as a "blue wool tie," it belongs in `missing_tokens`.
+- **Format:** Return a strict JSON object.
+
+**OUTPUT FORMAT:**
+{{
+  "present_tokens": [],
+  "missing_tokens": []
+}}
 """
     try:
         response = client.chat.completions.create(
@@ -474,6 +490,7 @@ Rules:
             temperature=0,
         )
         payload = json.loads(response.choices[0].message.content)
+        print(payload)
         raw_present = [t.strip().lower() for t in payload.get("present_tokens", []) if isinstance(t, str)]
         raw_missing = [t.strip().lower() for t in payload.get("missing_tokens", []) if isinstance(t, str)]
     except Exception:

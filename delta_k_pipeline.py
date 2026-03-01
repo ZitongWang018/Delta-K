@@ -2,10 +2,11 @@ from typing import Dict, List, Optional
 
 import torch
 
-from delta_k_core import run_diffusion_once
+from delta_k_core import run_diffusion_once,run_diffusion_wrapper
 from delta_k_scheduler import get_schedule
 from delta_k_utils import *
-
+import multiprocessing as mp
+from torch.cuda import device_count
 
 def generate_image_with_schedule(
     model_path: str,
@@ -32,7 +33,7 @@ def generate_image_with_schedule(
 
     # 注意：这里的 run_diffusion_once 需要确保能够接收并使用我们传入的 attn_cap
     img_baseline, _, steps_record = run_diffusion_once(
-        model_path, prompt, steps=steps, seed=seed, modify=None, active_steps=[], layer_paths=None, attn_cap=attn_cap
+        model_path, prompt, steps=int(steps/4), seed=seed, modify=None, active_steps=[], layer_paths=None, attn_cap=attn_cap
     )
 
     step_ids = sorted(steps_record.keys())
@@ -60,6 +61,7 @@ def generate_image_with_schedule(
 
     present, missing = analyze_present_missing(img_baseline, prompt, top_k=6)
     if not missing and schedule != "baseline":
+        print('already succeed, regenerating...')
         return img_baseline
 
     # [架构路由 3]：动态遮罩占位符 (SDXL 用 <|endoftext|>, FLUX 的 T5 用 <pad>)
@@ -120,14 +122,34 @@ def generate_image_with_schedule(
 
 
 def _collect_k_delta(model_path: str, prompt_pos: str, prompt_neg: str, steps: int, seed: int, attn_cap):
-    # 必须接收并传递 attn_cap
-    _, attn_pos, step_pos = run_diffusion_once(model_path, prompt_pos, steps=steps, seed=seed, attn_cap=attn_cap)
-    _, attn_neg, step_neg = run_diffusion_once(model_path, prompt_neg, steps=steps, seed=seed, attn_cap=attn_cap)
-    
+    if device_count() < 2:
+        raise RuntimeError("需要至少 2 个 GPU 才能并行运行")
+    ctx = mp.get_context('spawn')
+    with ctx.Manager() as manager:
+        # 2. 通过这个 ctx 创建 Manager 和 Process
+        return_dict = manager.dict()
+        # 定义两个进程，分别绑定 GPU 0 和 GPU 1
+        p1 = ctx.Process(
+            target=run_diffusion_wrapper, 
+            args=(1, model_path, prompt_pos, steps, seed, attn_cap.model_type, return_dict, "pos")
+        )
+        p2 = ctx.Process(
+            target=run_diffusion_wrapper, 
+            args=(2, model_path, prompt_neg, steps, seed, attn_cap.model_type, return_dict, "neg")
+    )
+        p1.start()
+        p2.start()
+        p1.join()
+        p2.join()
+
+        # 从返回字典中提取结果
+        _, attn_pos, step_pos = return_dict["pos"]
+        _, attn_neg, step_neg = return_dict["neg"]
+
     k_mean_pos = collect_k_mean(attn_pos["k"])
     k_mean_neg = collect_k_mean(attn_neg["k"])
 
-    def _to_list(step_dict: Dict[int, Dict]):
+    def _to_list(step_dict):
         return [step_dict[idx] for idx in sorted(step_dict.keys())]
 
     return k_mean_pos - k_mean_neg, _to_list(step_pos), _to_list(step_neg)
