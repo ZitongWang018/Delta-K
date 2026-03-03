@@ -56,12 +56,13 @@ def generate_image_with_schedule(
     if len(layer_names) > 3:
         layer_names = [layer_names[0], layer_names[len(layer_names) // 2], layer_names[-1]]
 
-    concepts = extract_concepts(prompt)
+    #concepts = extract_concepts(prompt)
     sample_layer = layer_names[0] if layer_names else next(iter(steps_record[first_step]["attention_weights"]))
     token_count = steps_record[first_step]["attention_weights"][sample_layer].shape[-1]
 
     tokenizers = attn_cap.load_tokenizers(model_path)
-    
+    present, missing = analyze_present_missing(img_baseline, prompt, top_k=6)
+    concepts = list(set(present + missing))
     # 3. 调用新的映射函数，传入 model_type
     idx_map = map_concepts_to_indices(
         tokenizers=tokenizers, 
@@ -70,7 +71,7 @@ def generate_image_with_schedule(
         model_type=attn_cap.model_type # 使用 Capture 对象中存储的类型
     )
 
-    present, missing = analyze_present_missing(img_baseline, prompt, top_k=6)
+    
     # img_baseline, _, _ = run_diffusion_once(
     #         model_path, prompt, steps=steps, seed=seed, modify=None, active_steps=[], layer_paths=None, attn_cap=attn_cap
     #     )
