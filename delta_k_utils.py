@@ -4,9 +4,11 @@ import json
 import math
 import os
 import re
+import threading
 from typing import Dict, List, Optional, Tuple, Any
 
 import torch
+import numpy as np
 from PIL import Image
 
 try:
@@ -49,6 +51,7 @@ class BaseCrossAttentionCapture:
         self.hooks: List[torch.utils.hooks.RemovableHandle] = []
         self.step = 0
         self.model_type = model_type
+        self.head_dim = 64
         self.target_layer_prefix = self._get_target_layer_prefix(model_type)
         self.general_layer_prefix = self._get_general_layer_prefix(model_type)
         self.mask_placeholder = self._get_mask_placeholder(model_type)
@@ -88,18 +91,17 @@ class BaseCrossAttentionCapture:
         if model_type == 'sdxl':
             return "down_blocks"
 
-    def _make_hook(self, layer_path: str, key_type: str, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None):
+    def _make_hook(self, layer_path: str, key: str, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None):
         def hook(module, inputs, outputs):
-            tensor = inputs[0]
-            self._maybe_inject(tensor, layer_path, key_type, modify, active_steps)
-            
-            target_dict = getattr(self, key_type)
-            target_dict[layer_path] = {"input": tensor.detach().cpu(), "output": outputs.detach().cpu()}
+            if (not modify or key not in modify or not modify[key].get("signal", False) or not active_steps or self.step not in active_steps)==False:
+                tensor = inputs[0]
+                self._maybe_inject(tensor, layer_path, key, modify, active_steps)
+            target_dict = getattr(self, key)
+            target_dict[layer_path] = {"input": inputs[0].detach(), "output": outputs.detach()}
         return hook
 
     def _maybe_inject(self, tensor, layer_path, key, modify, active_steps):
-        if not modify or key not in modify or not modify[key].get("signal", False) or not active_steps or self.step not in active_steps:
-            return
+
         config = modify[key]
         if not any(item in layer_path for item in config.get("layer_paths", [])):
             return
@@ -119,7 +121,11 @@ class BaseCrossAttentionCapture:
         self.hooks.clear()
 
     def take(self, clear: bool = True):
-        payload = {"q": self.q.copy(), "k": self.k.copy(), "v": self.v.copy()}
+        payload = {
+            "q": {k: {'input':v['input'].cpu(),'output':v['output'].cpu()} for k, v in self.q.items()},
+            "k": {k: {'input':v['input'].cpu(),'output':v['output'].cpu()} for k, v in self.k.items()},
+            "v": {k: {'input':v['input'].cpu(),'output':v['output'].cpu()} for k, v in self.v.items()}
+        }
         if clear:
             self.q.clear()
             self.k.clear()
@@ -146,17 +152,29 @@ class SDXLCapture(BaseCrossAttentionCapture):
                 for tidx, transformer in enumerate(attention.transformer_blocks):
                     attn2 = transformer.attn2
                     base = f"down_blocks.{bidx}.attentions.{aidx}.transformer_blocks.{tidx}.attn2"
-                    
                     self.hooks.append(attn2.to_q.register_forward_hook(self._make_hook(f"{base}.to_q", "q", modify, active_steps)))
                     self.hooks.append(attn2.to_k.register_forward_hook(self._make_hook(f"{base}.to_k", "k", modify, active_steps)))
                     self.hooks.append(attn2.to_v.register_forward_hook(self._make_hook(f"{base}.to_v", "v", modify, active_steps)))
 
-    def attention_qk(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
+    def attention_qk(self, query: torch.Tensor, key: torch.Tensor, head_dim: int = 64) -> torch.Tensor:
         q = query.to(torch.float32)
         k = key.to(torch.float32)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+        self.head_dim=64
+        b, sq, d = q.shape
+        _, sk, _ = k.shape
+        heads = d // head_dim 
+        
+        # SDXL 也是多头注意力，需要 reshape
+        # (B, S, D) -> (B, Heads, S, HeadDim)
+        q = q.view(b, sq, heads, head_dim).transpose(1, 2)
+        k = k.view(b, sk, heads, head_dim).transpose(1, 2)
+        
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
         scores = scores - scores.max(dim=-1, keepdim=True).values
         probs = torch.softmax(scores, dim=-1)
+        
+        # 对 heads 取平均，得到 (B, S, S)
+        probs = probs.mean(dim=1) 
         return torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
 
     def load_tokenizers(self, model_path: str):
@@ -178,10 +196,10 @@ class FluxCapture(BaseCrossAttentionCapture):
             self.hooks.append(attn.add_k_proj.register_forward_hook(self._make_hook(f"{base}.add_k_proj", "k", modify, active_steps)))
             self.hooks.append(attn.add_v_proj.register_forward_hook(self._make_hook(f"{base}.add_v_proj", "v", modify, active_steps)))
 
-    def attention_qk(self, query: torch.Tensor, key: torch.Tensor, head_dim: int = 64) -> torch.Tensor:
+    def attention_qk(self, query: torch.Tensor, key: torch.Tensor, head_dim: int = 128) -> torch.Tensor:
         q = query.to(torch.float32)
         k = key.to(torch.float32)
-        
+        self.head_dim=128
         b, sq, d = q.shape
         _, sk, _ = k.shape
         heads = d // head_dim 
@@ -226,7 +244,7 @@ class SD3Capture(BaseCrossAttentionCapture):
         # SD3 多头注意力计算 (与 FLUX 计算方式相同，动态推断 Heads)
         q = query.to(torch.float32)
         k = key.to(torch.float32)
-        
+        self.head_dim=64
         b, sq, d = q.shape
         _, sk, _ = k.shape
         heads = d // head_dim 
@@ -242,11 +260,18 @@ class SD3Capture(BaseCrossAttentionCapture):
         return torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
 
     def load_tokenizers(self, model_path: str):
+        # 【修改点】: SD3 必须加载 3 个 Tokenizer
         if CLIPTokenizer is None:
-            return None, None
+            return None, None, None
+        
         tok1 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer", local_files_only=True)
         tok2 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", local_files_only=True)
-        return tok1, tok2
+        
+        if T5TokenizerFast is None:
+            raise ImportError("加载 SD3 需要 T5TokenizerFast。")
+        tok3 = T5TokenizerFast.from_pretrained(model_path, subfolder="tokenizer_3", local_files_only=True)
+        
+        return tok1, tok2, tok3  # 返回 3 个
 
 
 MODEL_TO_CLASS = {
@@ -258,16 +283,18 @@ MODEL_TO_CLASS = {
 # ==========================================
 # 2. 回调函数改造
 # ==========================================
-
+class StepInterruptException(Exception):
+    """用于在达到指定步数时强制中断推理的自定义异常"""
+    pass
 class StepCallback:
-    def __init__(self, attn_cap: BaseCrossAttentionCapture, total_steps: int = 30):
+    def __init__(self, attn_cap: BaseCrossAttentionCapture, total_steps: int = 30, break_step: int = 10, record_step: int=10):
         self.attn_cap = attn_cap
         self.total_steps = total_steps
         self.steps: Dict[int, Dict] = {}
-
-    def __call__(self, pipe, step, timestep, kwargs):
-        self.attn_cap.step = step + 1
-        records = self.attn_cap.take(clear=False)
+        self.break_step = break_step
+        self.record_step = record_step
+        self._threads = [] 
+    def _async_process_step(self, step: int, records: Dict, latents: torch.Tensor, timestep):
         weights = {}
         q_record = {}
         k_record = {}
@@ -296,10 +323,7 @@ class StepCallback:
             weights[base_name] = self.attn_cap.attention_qk(q_cond, k_cond)
             q_record[base_name] = q_cond
             k_record[base_name] = k_cond
-            
-        latents = kwargs.get("latents", kwargs.get("hidden_states"))
-        
-        self.steps[step] = {
+            self.steps[step] = {
             "step": step,
             "timestep": int(timestep.item()) if hasattr(timestep, "item") else int(timestep),
             "attention_weights": weights,
@@ -307,8 +331,34 @@ class StepCallback:
             "k_record": k_record,
             "latents": latents.detach().cpu() if latents is not None else None,
         }
-        return kwargs
+    def __call__(self, pipe, step, timestep, kwargs):
+        self.attn_cap.step = step + 1
+        if self.break_step>0 and self.attn_cap.step>self.break_step:
+            for t in self._threads:
+                t.join()
+            raise StepInterruptException("Reached target_step_max, interrupting...")
+        if self.attn_cap.step >self.record_step:
+            return kwargs
+        records = self.attn_cap.take(clear=False)
 
+        self.attn_cap.q.clear()
+        self.attn_cap.k.clear()
+        self.attn_cap.v.clear()
+        latents = kwargs.get("latents", kwargs.get("hidden_states"))
+        t_val = int(step.item()) if hasattr(step, "item") else int(step)
+        
+        thread = threading.Thread(
+            target=self._async_process_step, 
+            args=(step, records, latents,timestep) # 传递 GPU 引用给线程
+        )
+        thread.start()
+        self._threads.append(thread)
+        
+        return kwargs
+    def finalize(self):
+        """可选：在所有推理结束后，调用此方法确保所有后台线程已完成"""
+        for t in self._threads:
+            t.join()
 def compute_concept_k_mean(step_data: Dict[int, Dict], layer_names: List[str], indices: List[int]) -> float:
     if not indices:
         return 0.0
@@ -384,26 +434,89 @@ def tokens_from_prompt(tokenizer, prompt: str) -> List[str]:
     return tokens
 
 
-def map_concepts_to_indices(tok1, tok2, prompt: str, concepts: List[str], max_tokens: int) -> Dict[str, List[int]]:
-    if tok1 is None or tok2 is None:
-        return {concept: [] for concept in concepts}
-    t1 = [_clean_token(x) for x in tokens_from_prompt(tok1, prompt)]
-    t2 = [_clean_token(x) for x in tokens_from_prompt(tok2, prompt)]
-    total = min(max_tokens, len(t1) + len(t2))
+def map_concepts_to_indices(
+    tokenizers: Tuple, 
+    prompt: str, 
+    concepts: List[str], 
+    model_type: str
+) -> Dict[str, List[int]]:
+    """
+    根据模型类型执行正确的索引映射策略。
+    
+    Args:
+        tokenizers: Tokenizer 元组 (数量取决于模型)
+        prompt: 原始提示词
+        concepts: 概念列表
+        model_type: 'sdxl', 'flux', 或 'sd3'
+    """
     mapping: Dict[str, List[int]] = {concept: [] for concept in concepts}
-    for concept in concepts:
-        parts = [_clean_token(x) for x in re.findall(r"[a-z]+", concept)]
-        for idx, word in enumerate(t1):
-            if idx >= total:
-                break
-            if any(p and p in word for p in parts):
-                mapping[concept].append(idx)
-        for idx, word in enumerate(t2):
-            real_idx = len(t1) + idx
-            if real_idx >= total:
-                break
-            if any(p and p in word for p in parts):
-                mapping[concept].append(real_idx)
+    
+    def get_clean_tokens(tok):
+        ids = tok(prompt, return_tensors="pt").input_ids[0].tolist()
+        return [_clean_token(x) for x in tok.convert_ids_to_tokens(ids)]
+
+    # --- 策略 1: SDXL (索引对齐) ---
+    if model_type == 'sdxl':
+        tok1, tok2 = tokenizers[0], tokenizers[1]
+        t1 = get_clean_tokens(tok1)
+        # t2 = get_clean_tokens(tok2) # SDXL中t2与t1索引一一对应，主要用于验证
+        
+        for concept in concepts:
+            parts = [_clean_token(x) for x in re.findall(r"[a-z]+", concept)]
+            for idx, word in enumerate(t1):
+                # 只要 Tokenizer1 或 Tokenizer2 中有一个包含概念，该索引即有效
+                # 注意：这里简化处理，通常 t1 和 t2 的 clean word 是一致的
+                if any(p and p in word for p in parts):
+                    mapping[concept].append(idx)
+
+    # --- 策略 2: FLUX (仅 T5) ---
+    elif model_type == 'flux':
+        # FLUX 不使用 tokenizer_1 (CLIP) 的序列索引
+        if len(tokenizers) < 2:
+            return mapping
+        t5_tokens = get_clean_tokens(tokenizers[1])
+        
+        for concept in concepts:
+            parts = [_clean_token(x) for x in re.findall(r"[a-z]+", concept)]
+            for idx, word in enumerate(t5_tokens):
+                if any(p and p in word for p in parts):
+                    mapping[concept].append(idx)
+
+    # --- 策略 3: SD3 (序列拼接: CLIP + T5) ---
+    elif model_type == 'sd3':
+        if len(tokenizers) < 3:
+            return mapping
+        
+        t_l = get_clean_tokens(tokenizers[0])
+        t_g = get_clean_tokens(tokenizers[1])
+        t_t5 = get_clean_tokens(tokenizers[2])
+        
+        # SD3.5 Medium 确认: CLIP 部分固定为 77，T5 部分最大 256
+        # 实际逻辑中应使用 tokenizer 的实际长度或模型配置的长度
+        clip_len = 77 
+        
+        for concept in concepts:
+            parts = [_clean_token(x) for x in re.findall(r"[a-z]+", concept)]
+            
+            # 1. CLIP L/G 部分 (索引 0 ~ 76)
+            # 逻辑：只要在 L 或 G 中出现，就算作该索引
+            for idx in range(clip_len):
+                w_l = t_l[idx] if idx < len(t_l) else ""
+                w_g = t_g[idx] if idx < len(t_g) else ""
+                
+                if any(p and (p in w_l or p in w_g) for p in parts):
+                    mapping[concept].append(idx)
+            
+            # 2. T5 部分 (索引 77 ~ 333)
+            # 逻辑：如果在 T5 中出现，索引需加上 CLIP 的偏移量
+            for idx, word in enumerate(t_t5):
+                if any(p and p in word for p in parts):
+                    mapping[concept].append(clip_len + idx)
+
+    # 清理重复索引
+    for concept in mapping:
+        mapping[concept] = sorted(list(set(mapping[concept])))
+        
     return mapping
 
 
@@ -430,7 +543,56 @@ def gather_indices(idx_map: Dict[str, List[int]], concepts: List[str], exclude: 
     indices = sorted({idx for concept in concepts if concept not in exclude for idx in idx_map.get(concept, [])})
     return indices
 
+def calculate_token_stats(step_data: Dict[int, Dict], layer_names: List[str], indices: List[int], label: str):
+    if not indices:
+        return {f"{label}_{k}": 0.0 for k in ["mean", "max", "std", "var", "cv", "p90", "sparsity"]} | {"step_wise": {}}
 
+    all_raw_values = []
+    step_wise_data = {} # 新增：按 step 存储
+    steps = sorted(step_data.keys())
+    
+    for step in steps:
+        step_vals = []
+        for name in layer_names:
+            attn = step_data[step]["attention_weights"].get(name)
+            if attn is None: continue
+            
+            dims_to_reduce = tuple(range(attn.ndim - 1))
+            avg_attn = torch.abs(attn).mean(dim=dims_to_reduce)
+            
+            valid_idx = [i for i in indices if i < avg_attn.shape[0]]
+            if valid_idx:
+                v = avg_attn[valid_idx].detach().cpu()
+                all_raw_values.append(v)
+                step_vals.append(v)
+        
+        # 记录当前 step 的局部统计
+        if step_vals:
+            step_combined = torch.cat(step_vals)
+            step_wise_data[int(step)] = {
+                "mean": float(step_combined.mean().item()),
+                "max": float(step_combined.max().item()),
+                "var": float(step_combined.var().item()) # 考察该步内层间的剧烈程度
+            }
+
+    if not all_raw_values:
+        return {f"{label}_mean": 0.0, "step_wise": {}}
+
+    combined = torch.cat(all_raw_values)
+    mean_v = combined.mean().item()
+    std_v = combined.std().item()
+    
+    stats = {
+        f"{label}_mean": mean_v,
+        f"{label}_max":  combined.max().item(),
+        f"{label}_std":  std_v,
+        f"{label}_var":  combined.var().item(), # 全局方差
+        f"{label}_cv":   (std_v / mean_v) if mean_v > 0 else 0,
+        f"{label}_p90":  torch.quantile(combined, 0.9).item(),
+        f"{label}_sparsity": (combined < (mean_v * 0.1)).float().mean().item(),
+        "step_wise": step_wise_data # 包含分步明细
+    }
+    return stats
 def pil_to_data_url(image: Image.Image) -> str:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")

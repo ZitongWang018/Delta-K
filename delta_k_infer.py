@@ -124,7 +124,7 @@ def main():
                 attn_cap=attn_cap
             )
             filename = f"{batch_prompts[0]}_{counter:06d}.png"
-            image.save(sample_dir / filename)
+            # image.save(sample_dir / filename)
             counter += 1
             # except Exception as exc:
             #     errors += 1
@@ -134,4 +134,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
 

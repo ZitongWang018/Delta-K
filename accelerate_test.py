@@ -36,9 +36,9 @@ class BenchmarkConfig:
     # -------------------------- 核心模型配置 --------------------------
     # 模型路径配置：支持任意SD系列/FLUX系列模型，自动识别架构
     model_paths: Dict[str, str] = field(default_factory=lambda: {
-        "sdxl": "/data/yulin/hf_cache/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b",
+        # "sdxl": "/data/yulin/hf_cache/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b",
         "sd3.5medium": "/data/yulin/hf_cache/hub/models--stabilityai--stable-diffusion-3.5-medium/snapshots/b940f670f0eda2d07fbb75229e779da1ad11eb80",
-        "flux": "/data/yulin/hf_cache/hub/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21"
+        # "flux": "/data/yulin/hf_cache/hub/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21"
     })
     # 硬件配置
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

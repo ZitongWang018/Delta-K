@@ -7,7 +7,7 @@ from diffusers import DiffusionPipeline
 from delta_k_utils import *
 
 
-def build_pipeline(model_path: str, is_flux: bool = False):
+def build_pipeline(model_path: str):
     try:
         device, dtype = "cuda",torch.bfloat16
     except:
@@ -21,7 +21,7 @@ def build_pipeline(model_path: str, is_flux: bool = False):
     )
     return pipe.to(device)
 
-def run_diffusion_wrapper(gpu_id, model_path, prompt, steps, seed, model_type, return_dict, key):
+def run_diffusion_wrapper(gpu_id, model_path, prompt, steps, seed, model_type, return_dict, target_step_max=-1, record_step=40, key=''):
     """
     这个包装器运行在子进程中
     """
@@ -40,7 +40,8 @@ def run_diffusion_wrapper(gpu_id, model_path, prompt, steps, seed, model_type, r
             active_steps=[], 
             layer_paths=None, 
             attn_cap=sub_cap,
-            # device=device # 如果函数支持
+            target_step_max=target_step_max,
+            record_step= record_step
         )
     
         # 将结果存入共享字典
@@ -58,7 +59,9 @@ def run_diffusion_once(
     modify: Optional[Dict] = None,
     active_steps: Optional[List[int]] = None,
     layer_paths: Optional[List[str]] = None,
-    attn_cap = None
+    attn_cap = None,
+    target_step_max = -1,
+    record_step = 40
 ) -> Tuple["PIL.Image.Image", Dict, Dict[int, Dict]]:
     
 
@@ -80,20 +83,25 @@ def run_diffusion_once(
     
     # 执行挂载
     attn_cap.attach(target_model, modify=modify, active_steps=active_steps or [])
-    callback = StepCallback(attn_cap, total_steps=steps)
+    callback = StepCallback(attn_cap, total_steps=steps, break_step=target_step_max,record_step=record_step)
     
     # [架构感知 5]：动态请求 Pipeline 的回调张量
     tensor_inputs = attn_cap.tensor_inputs
-    
-    result = pipe(
-        prompt=prompt,
-        num_inference_steps=steps,
-        output_type="pil",
-        callback_on_step_end=callback,
-        callback_on_step_end_tensor_inputs=tensor_inputs,
-        generator=torch.Generator(device).manual_seed(seed),
-    )
-    
+    try:
+        result = pipe(
+            prompt=prompt,
+            num_inference_steps=steps,
+            output_type="pil",
+            callback_on_step_end=callback,
+            callback_on_step_end_tensor_inputs=tensor_inputs,
+            generator=torch.Generator(device).manual_seed(seed),
+        )
+        return_image = result.images[0]
+    except StepInterruptException:
+        # 捕获到中断信号，此时 pipe 已经停止运行
+        print(f"Inference stopped early at step {target_step_max}")
+        return_image = None
+    callback.finalize()
     # 提取快照并卸载 Hook
     attn_snapshot = attn_cap.take(clear=True)
     attn_cap.remove()
@@ -102,4 +110,4 @@ def run_diffusion_once(
     del pipe
     torch.cuda.empty_cache()
     
-    return result.images[0], attn_snapshot, callback.steps
+    return return_image, attn_snapshot, callback.steps

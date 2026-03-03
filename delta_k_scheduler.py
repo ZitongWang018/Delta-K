@@ -147,61 +147,140 @@ def build_vlm_gap_burst(
     alpha = _compute_alpha(k_present, k_missing, alpha_floor)
     return (smax * alpha * burst * window).tolist()
 
+from torch.optim import Adam
+import math
+
 def build_mean_of_concept_schedule(
     target_stats: List[Dict],
     attn_pos: List[Dict],
     attn_neg: List[Dict],
     indices: List[int],
     max_steps: int,
-    attn_cap,  # [新增参数] 接收捕获实例以获取动态的方法和模型属性
+    attn_cap,  # 接收捕获实例，自动获取 head_dim 和 layer_prefix
     strength_limit: float = 0.03,
 ) -> List[float]:
     schedule = []
     
-    # [核心修改 1] 动态匹配层名前缀
-    # SDXL 通常通过干预 down_blocks.1 来控制早期概念布局
-    # FLUX 则干预早中期的 transformer_blocks
+    # 1. 从 capture 实例获取动态配置
     layer_filter = attn_cap.target_layer_prefix
+    head_dim = attn_cap.head_dim
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # ==========================================
+    # 内部辅助函数：复刻 attention_qk 的核心逻辑
+    # ==========================================
+    def _compute_logits(q, k):
+        """计算 Q @ K^T / sqrt(d)，返回"""
+        b, sq, d = q.shape
+        _, sk, _ = k.shape
+        heads = d // head_dim
+        
+        # 维度 Reshape: (B, S, D) -> (B, Heads, S, HeadDim)
+        q = q.view(b, sq, heads, head_dim).transpose(1, 2)
+        k = k.view(b, sk, heads, head_dim).transpose(1, 2)
+        
+        # 计算缩放点积
+        return torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+
+    def _logits_to_attn(logits):
+        """将 Logits 转换为概率图 (Softmax + Mean Heads)"""
+        # 数值稳定性
+        logits = logits - logits.max(dim=-1, keepdim=True).values
+        probs = torch.softmax(logits, dim=-1)
+        # 对 heads 取平均 -> (B, S, S)
+        return probs.mean(dim=1)
+
+    # ==========================================
+    # 主循环
+    # ==========================================
     for step in range(min(len(attn_pos), max_steps)):
         if step >= len(attn_neg) or step >= len(target_stats):
             break
             
         layer_names = [
-            name for name in attn_pos[step]["attention_weights"].keys() if layer_filter in name
+            name for name in attn_pos[step]["attention_weights"].keys() 
+            if layer_filter in name
         ]
         
         if not layer_names:
             schedule.append(0.0)
             continue
 
-        def objective(alpha: torch.Tensor):
-            total = 0.0
-            for name in layer_names:
-                a_mean = target_stats[step][name]
+        # ---------------------------------------------------------
+        # A. 预计算阶段
+        # ---------------------------------------------------------
+        # 将 O(N^2*D) 的矩阵乘法提取出来，避免在优化循环中重复计算
+        precomputed = []
+        
+        for name in layer_names:
+            # 1. 获取数据 (兼容字典格式 {"input":..., "output":...})
+            q_data = attn_pos[step]["q_record"][name]
+            k_pos_data = attn_pos[step]["k_record"][name]
+            k_neg_data = attn_neg[step]["k_record"][name]
+            
+            # 提取 output (投影后的张量)
+            q = q_data["output"] if isinstance(q_data, dict) else q_data
+            k_pos = k_pos_data["output"] if isinstance(k_pos_data, dict) else k_pos_data
+            k_neg = k_neg_data["output"] if isinstance(k_neg_data, dict) else k_neg_data
+            
+            # 转换精度与设备
+            q = q.to(torch.float32).to(device)
+            k_pos = k_pos.to(torch.float32).to(device)
+            k_neg = k_neg.to(torch.float32).to(device)
+            
+            # 2. 计算 Delta K
+            delta_k = k_pos - k_neg
+            
+            # 3. 计算 Logits (这是最耗时的部分)
+            # S_pos = Q @ K_pos.T
+            # S_delta = Q @ Delta_K.T
+            s_pos = _compute_logits(q, k_pos)
+            s_delta = _compute_logits(q, delta_k)
+            
+            # 4. 获取目标
+            a_mean = target_stats[step][name].to(torch.float32).to(device)
+            
+            precomputed.append((s_pos, s_delta, a_mean))
+
+        # ---------------------------------------------------------
+        # B. 快速优化阶段
+        # ---------------------------------------------------------
+        def objective_fast(alpha: torch.Tensor):
+            total = torch.tensor(0.0, device=device)
+            
+            for s_pos, s_delta, a_mean in precomputed:
+                # 1. 线性组合 Logits (仅需标量乘法，极快)
+                logits = s_pos + alpha * s_delta
                 
-                # [核心修改 2] 调用实例的多态 attention_qk 方法
-                attn = attn_cap.attention_qk(
-                    attn_pos[step]["q_record"][name],
-                    alpha * (attn_pos[step]["k_record"][name] - attn_neg[step]["k_record"][name]),
-                )
+                # 2. 转换为 Attention Map (Softmax)
+                attn = _logits_to_attn(logits)
                 
-                attn = attn[0, :, indices]
-                expanded = torch.broadcast_to(a_mean.unsqueeze(1), attn.shape)
-                total = total + ((expanded - attn) ** 2).sum()
+                # 3. 计算损失
+                # 取出对应 concept indices 的列
+                attn_sel = attn[0, :, indices]
+                
+                # MSE
+                expanded = a_mean.unsqueeze(1).expand_as(attn_sel)
+                total = total + ((expanded - attn_sel) ** 2).sum()
+                
             return total
 
-        alpha = torch.tensor([0.05], requires_grad=True)
-        optimizer = Adam([alpha], lr=1e-3)
+        # 初始化 Alpha
+        alpha = torch.tensor([0.0], requires_grad=True, device=device)
+        optimizer = Adam([alpha], lr=0.1) # 学习率可以设大一点
+        
+        # 优化循环
         for _ in range(100):
             optimizer.zero_grad()
-            loss_val = objective(alpha)
-            grad = torch.autograd.grad(loss_val, alpha, create_graph=True)[0]
-            (grad ** 2).backward()
+            loss_val = objective_fast(alpha)
+            loss_val.backward()
             optimizer.step()
+            # print(alpha)
             
+        # 限制范围并记录
         value = float(alpha.item())
         value = max(-strength_limit, min(strength_limit, value))
         schedule.append(value)
         
     return schedule
+
