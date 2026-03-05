@@ -2,7 +2,7 @@ import argparse
 import runpy
 from pathlib import Path
 from typing import List, Optional
-
+from delta_k_core import build_pipeline
 from delta_k_pipeline import generate_image_with_schedule
 from delta_k_utils import *
 DEFAULT_CONFIG = {
@@ -101,7 +101,6 @@ def main():
     outdir = args.outdir or cfg["output"]["dir"]
     sched_config = cfg.get("schedulers", {})
     model_type=cfg["model"]["model_type"]
-
     prompts = load_prompts(prompt_text, prompt_file, batch_size=batch_size)
     outdir = Path(outdir)
     sample_dir = outdir / "samples"
@@ -110,6 +109,9 @@ def main():
     counter = len(list(sample_dir.glob("*.png")))
     errors = 0
     attn_cap = BaseCrossAttentionCapture(model_type=model_type)
+
+    main_pipe = build_pipeline(model_path)
+    # 2. 你的主循环
     for batch_prompts in prompts:
         for iteration in range(n_iter):
             # try:
@@ -121,14 +123,19 @@ def main():
                 seed=seed + iteration,
                 qwen_api_key=args.qwen_api_key,
                 schedule_config=sched_config,
-                attn_cap=attn_cap
+                attn_cap=attn_cap,
+                main_pipe=main_pipe
             )
             filename = f"{batch_prompts[0]}_{counter:06d}.png"
-            # image.save(sample_dir / filename)
-            counter += 1
+            if image:
+                image.save(sample_dir / filename)
+                counter += 1
             # except Exception as exc:
             #     errors += 1
             #     print(f"[WARN] {exc}")
+    
+    
+
 
 
 

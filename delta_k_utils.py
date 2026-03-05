@@ -95,11 +95,18 @@ class BaseCrossAttentionCapture:
         def hook(module, inputs, outputs):
             if (not modify or key not in modify or not modify[key].get("signal", False) or not active_steps or self.step not in active_steps)==False:
                 tensor = inputs[0]
-                self._maybe_inject(tensor, layer_path, key, modify, active_steps)
+                # self._maybe_inject(tensor, layer_path, key, modify, active_steps)
             target_dict = getattr(self, key)
             target_dict[layer_path] = {"input": inputs[0].detach(), "output": outputs.detach()}
         return hook
 
+    def _make_pre_hook(self, layer_path: str, key: str, modify: Optional[Dict] = None, active_steps: Optional[List[int]] = None):
+        # Pre-hook 只有 module 和 inputs，没有 outputs
+        def hook(module, inputs): 
+            if (not modify or key not in modify or not modify[key].get("signal", False) or not active_steps or self.step not in active_steps)==False:
+                tensor = inputs[0]
+                self._maybe_inject(tensor, layer_path, key, modify, active_steps)
+        return hook
     def _maybe_inject(self, tensor, layer_path, key, modify, active_steps):
 
         config = modify[key]
@@ -111,9 +118,17 @@ class BaseCrossAttentionCapture:
         else:
             strength = float(config.get("strength", 0.0))
         delta = config.get("value")
+        # print('strength',strength)
         if delta is None or strength == 0.0:
             return
+        # print(delta.to(tensor.device) * strength)
         tensor.data.add_(delta.to(tensor.device) * strength)
+        # old_mean = tensor.mean().item()
+        # tensor.data.add_(delta.to(tensor.device) * strength)
+        # new_mean = tensor.mean().item()
+        
+        # if abs(new_mean - old_mean) > 1e-6:
+        #     print(f"DEBUG: Layer {layer_path} injected! Shift: {old_mean:.6f} -> {new_mean:.6f}")
 
     def remove(self) -> None:
         for hook in self.hooks:
@@ -154,6 +169,7 @@ class SDXLCapture(BaseCrossAttentionCapture):
                     base = f"down_blocks.{bidx}.attentions.{aidx}.transformer_blocks.{tidx}.attn2"
                     self.hooks.append(attn2.to_q.register_forward_hook(self._make_hook(f"{base}.to_q", "q", modify, active_steps)))
                     self.hooks.append(attn2.to_k.register_forward_hook(self._make_hook(f"{base}.to_k", "k", modify, active_steps)))
+                    self.hooks.append(attn2.to_k.register_forward_pre_hook(self._make_pre_hook(f"{base}.to_k", "k", modify, active_steps)))
                     self.hooks.append(attn2.to_v.register_forward_hook(self._make_hook(f"{base}.to_v", "v", modify, active_steps)))
 
     def attention_qk(self, query: torch.Tensor, key: torch.Tensor, head_dim: int = 64) -> torch.Tensor:
@@ -194,6 +210,7 @@ class FluxCapture(BaseCrossAttentionCapture):
             
             self.hooks.append(attn.to_q.register_forward_hook(self._make_hook(f"{base}.to_q", "q", modify, active_steps)))
             self.hooks.append(attn.add_k_proj.register_forward_hook(self._make_hook(f"{base}.add_k_proj", "k", modify, active_steps)))
+            self.hooks.append(attn.add_k_proj.register_forward_pre_hook(self._make_pre_hook(f"{base}.add_k_proj", "k", modify, active_steps)))
             self.hooks.append(attn.add_v_proj.register_forward_hook(self._make_hook(f"{base}.add_v_proj", "v", modify, active_steps)))
 
     def attention_qk(self, query: torch.Tensor, key: torch.Tensor, head_dim: int = 128) -> torch.Tensor:
@@ -238,6 +255,7 @@ class SD3Capture(BaseCrossAttentionCapture):
             
             self.hooks.append(attn.to_q.register_forward_hook(self._make_hook(f"{base}.to_q", "q", modify, active_steps)))
             self.hooks.append(attn.add_k_proj.register_forward_hook(self._make_hook(f"{base}.add_k_proj", "k", modify, active_steps)))
+            self.hooks.append(attn.add_k_proj.register_forward_pre_hook(self._make_pre_hook(f"{base}.add_k_proj", "k", modify, active_steps)))
             self.hooks.append(attn.add_v_proj.register_forward_hook(self._make_hook(f"{base}.add_v_proj", "v", modify, active_steps)))
 
     def attention_qk(self, query: torch.Tensor, key: torch.Tensor, head_dim: int = 64) -> torch.Tensor:
@@ -287,18 +305,19 @@ class StepInterruptException(Exception):
     """用于在达到指定步数时强制中断推理的自定义异常"""
     pass
 class StepCallback:
-    def __init__(self, attn_cap: BaseCrossAttentionCapture, total_steps: int = 30, break_step: int = 10, record_step: int=10):
+    def __init__(self, attn_cap: BaseCrossAttentionCapture, total_steps: int = 30, break_step: int = 10, record_step: int=10,batch_size:int = 1):
         self.attn_cap = attn_cap
         self.total_steps = total_steps
         self.steps: Dict[int, Dict] = {}
         self.break_step = break_step
         self.record_step = record_step
+        self.batch_size = batch_size
         self._threads = [] 
     def _async_process_step(self, step: int, records: Dict, latents: torch.Tensor, timestep):
         weights = {}
         q_record = {}
         k_record = {}
-        
+        k_input_record = {}
         # 【修改点 1】：直接遍历 q 字典的键，而不是用列表索引
         for q_key, q_data in records["q"].items():
             # 获取当前层的基础名字 (例如 "transformer_blocks.0.attn")
@@ -314,21 +333,23 @@ class StepCallback:
                 
             q = q_data["output"]
             k = records["k"][k_key]["output"]
-            
+            k_in = records["k"][k_key]["input"]
             # 兼容 CFG(B=2) 和 Non-CFG(B=1)
-            q_cond = q[-1:]
-            k_cond = k[-1:]
-            
+            q_cond = q[-self.batch_size:]
+            k_cond = k[-self.batch_size:]
+            k_in_cond = k_in[-self.batch_size:]
             # 通过多态调用各自架构的 attention 计算
             weights[base_name] = self.attn_cap.attention_qk(q_cond, k_cond)
             q_record[base_name] = q_cond
             k_record[base_name] = k_cond
-            self.steps[step] = {
+            k_input_record[base_name] = k_in_cond
+        self.steps[step] = {
             "step": step,
             "timestep": int(timestep.item()) if hasattr(timestep, "item") else int(timestep),
             "attention_weights": weights,
             "q_record": q_record,
             "k_record": k_record,
+            "k_input_record": k_input_record,
             "latents": latents.detach().cpu() if latents is not None else None,
         }
     def __call__(self, pipe, step, timestep, kwargs):
@@ -345,8 +366,7 @@ class StepCallback:
         self.attn_cap.k.clear()
         self.attn_cap.v.clear()
         latents = kwargs.get("latents", kwargs.get("hidden_states"))
-        t_val = int(step.item()) if hasattr(step, "item") else int(step)
-        
+
         thread = threading.Thread(
             target=self._async_process_step, 
             args=(step, records, latents,timestep) # 传递 GPU 引用给线程
@@ -531,13 +551,6 @@ def mask_prompt_with_missing(prompt: str, missing_terms: List[str], placeholder:
     return masked
 
 
-def collect_k_mean(attn_ref: Dict[str, Dict[str, torch.Tensor]]) -> torch.Tensor:
-    k_inputs = [value["input"] for value in attn_ref.values()]
-    if not k_inputs:
-        raise ValueError("未捕获到任何 K 输入")
-    return torch.stack(k_inputs, dim=0).mean(dim=0)
-
-
 def gather_indices(idx_map: Dict[str, List[int]], concepts: List[str], exclude: Optional[List[str]] = None) -> List[int]:
     exclude = set(exclude or [])
     indices = sorted({idx for concept in concepts if concept not in exclude for idx in idx_map.get(concept, [])})
@@ -607,11 +620,9 @@ def _norm_words(text: str) -> List[str]:
 def analyze_present_missing(image: Image.Image, prompt: str, top_k: int = 8) -> Tuple[List[str], List[str]]:
     api_key = "sk-6b8c3387f0374255ab6adb1211382810"
     if not api_key or OpenAI is None:
-        print(1)
         return [], []
     api_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     if not api_base_url:
-        print(2)
         return [], []
     client = OpenAI(api_key=api_key, base_url=api_base_url)
     data_url = pil_to_data_url(image)

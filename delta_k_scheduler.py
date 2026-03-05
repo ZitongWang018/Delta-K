@@ -2,9 +2,9 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-from torch.optim import Adam
-
-
+from torch.optim import Adam,SGD
+import time
+import concurrent.futures
 def get_schedule(
     name: str,
     *,
@@ -157,14 +157,16 @@ def build_mean_of_concept_schedule(
     indices: List[int],
     max_steps: int,
     attn_cap,  # 接收捕获实例，自动获取 head_dim 和 layer_prefix
-    strength_limit: float = 0.03,
+    strength_limit: float = 0.05,
+    max_workers: int=4
 ) -> List[float]:
-    schedule = []
+
     
     # 1. 从 capture 实例获取动态配置
     layer_filter = attn_cap.target_layer_prefix
     head_dim = attn_cap.head_dim
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    num_gpus = torch.cuda.device_count()
+
 
     # ==========================================
     # 内部辅助函数：复刻 attention_qk 的核心逻辑
@@ -193,9 +195,7 @@ def build_mean_of_concept_schedule(
     # ==========================================
     # 主循环
     # ==========================================
-    for step in range(min(len(attn_pos), max_steps)):
-        if step >= len(attn_neg) or step >= len(target_stats):
-            break
+    def optimize_single_step(step: int) -> float:
             
         layer_names = [
             name for name in attn_pos[step]["attention_weights"].keys() 
@@ -203,9 +203,11 @@ def build_mean_of_concept_schedule(
         ]
         
         if not layer_names:
-            schedule.append(0.0)
-            continue
-
+            return 0.0
+        if num_gpus > 0:
+            device = f"cuda:{step % num_gpus}"
+        else:
+            device = "cpu"
         # ---------------------------------------------------------
         # A. 预计算阶段
         # ---------------------------------------------------------
@@ -238,49 +240,73 @@ def build_mean_of_concept_schedule(
             s_delta = _compute_logits(q, delta_k)
             
             # 4. 获取目标
+            s_pos = s_pos.to(torch.bfloat16)
+            s_delta = s_delta.to(torch.bfloat16)
             a_mean = target_stats[step][name].to(torch.float32).to(device)
             
             precomputed.append((s_pos, s_delta, a_mean))
 
-        # ---------------------------------------------------------
-        # B. 快速优化阶段
-        # ---------------------------------------------------------
-        def objective_fast(alpha: torch.Tensor):
-            total = torch.tensor(0.0, device=device)
-            
-            for s_pos, s_delta, a_mean in precomputed:
-                # 1. 线性组合 Logits (仅需标量乘法，极快)
-                logits = s_pos + alpha * s_delta
-                
-                # 2. 转换为 Attention Map (Softmax)
-                attn = _logits_to_attn(logits)
-                
-                # 3. 计算损失
-                # 取出对应 concept indices 的列
-                attn_sel = attn[0, :, indices]
-                
-                # MSE
-                expanded = a_mean.unsqueeze(1).expand_as(attn_sel)
-                total = total + ((expanded - attn_sel) ** 2).sum()
-                
-            return total
+
 
         # 初始化 Alpha
         alpha = torch.tensor([0.0], requires_grad=True, device=device)
-        optimizer = Adam([alpha], lr=0.1) # 学习率可以设大一点
-        
+        optimizer = torch.optim.Adam([alpha], lr=0.003)
+        max_time_seconds = 3      # 最大执行时间 (秒)
+        patience = 3               # 容忍次数 (连续多少次没改善就停止)
+        min_delta = 1e-4 
+        best_loss = float('inf')
+        no_improve_cnt = 0
+        start_time = time.time()
         # 优化循环
-        for _ in range(100):
+        for _ in range(500):
+            if time.time() - start_time > max_time_seconds:
+                # print(f"Step {step}: 优化超时 ({max_time_seconds}s)，强制中断。") # 取消注释可查看信息
+                break
+
             optimizer.zero_grad()
-            loss_val = objective_fast(alpha)
-            loss_val.backward()
+            current_total_loss = 0.0
+            for s_pos, s_delta, a_mean in precomputed:
+                # 恢复回 float32 进行高精度 Softmax 和 Loss 计算
+                logits = s_pos.to(torch.float32) + alpha * s_delta.to(torch.float32)
+                
+                attn = _logits_to_attn(logits)
+                attn_sel = attn[0, :, indices]
+                
+                expanded = a_mean.unsqueeze(1).expand_as(attn_sel)
+                layer_loss = ((expanded - attn_sel) ** 2).mean()
+                
+                layer_loss.backward()
+                current_total_loss += layer_loss.item()
+                
+            # 所有层都清算完毕后，统一走一步优化
+            torch.nn.utils.clip_grad_norm_([alpha], max_norm=1.0)
             optimizer.step()
-            # print(alpha)
+            # print(step,alpha)
+
             
+            # [新增] 2. 早停机制逻辑
+            if current_total_loss < best_loss - min_delta:
+                best_loss = current_total_loss
+                no_improve_cnt = 0  # 发生有效改善，重置容忍计数器
+            else:
+                no_improve_cnt += 1 # 改善微弱或恶化，累加计数器
+                
+            if no_improve_cnt >= patience:
+                # print(f"Step {step}: 连续 {patience} 步未见显著改善，触发早停。") # 取消注释可查看信息
+                break
         # 限制范围并记录
         value = float(alpha.item())
-        value = max(-strength_limit, min(strength_limit, value))
-        schedule.append(value)
-        
-    return schedule
+        return max(-strength_limit, min(strength_limit, value))
+    actual_max_steps = min(len(attn_pos), len(attn_neg), len(target_stats), max_steps)
+    
+    # 如果没有 step 需要处理，直接返回空
+    if actual_max_steps <= 0:
+        return []
+
+    # 使用线程池并行执行
+    # executor.map 会保证返回的 list 顺序与 range(actual_max_steps) 的顺序完全一致
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        schedule = list(executor.map(optimize_single_step, range(actual_max_steps)))
+
+    return schedule   
 
